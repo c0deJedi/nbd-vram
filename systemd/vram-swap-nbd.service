@@ -16,6 +16,10 @@ Environment=VRAM_SETUP_SIZE_MB=7168
 Environment=VRAM_SWAP_PRIORITY=1500
 Environment=VRAM_NBD_THREADS=4
 Environment=VRAM_NBD_CONNECTIONS=4
+# lz4-compress pages in VRAM (needs liblz4). 0 = off (default, 1:1 mapping).
+Environment=VRAM_COMPRESS=0
+# Logical swap size / physical VRAM when VRAM_COMPRESS=1 (1.0-8.0, default 2.0).
+Environment=VRAM_COMPRESS_RATIO=2.0
 
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1

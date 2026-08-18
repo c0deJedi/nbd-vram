@@ -20,6 +20,9 @@ echo "=== building ==="
 make
 
 echo "=== starting nbd-vram daemon ==="
+if [ "${VRAM_COMPRESS:-0}" != "0" ]; then
+    echo "      VRAM_COMPRESS=${VRAM_COMPRESS} ratio=${VRAM_COMPRESS_RATIO:-2.0}"
+fi
 ./nbd-vram &
 NBD_PID=$!
 echo "PID: $NBD_PID"
@@ -61,7 +64,11 @@ rm -f /tmp/vram-test-in /tmp/vram-test-out
 echo ""
 echo "=== activating swap ==="
 mkswap "$NBD_DEV"
-swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
+if [ "${VRAM_COMPRESS:-0}" != "0" ]; then
+    swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}" --discard=pages
+else
+    swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
+fi
 
 echo ""
 swapon --show

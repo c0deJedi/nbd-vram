@@ -26,7 +26,11 @@ restore_swap() {
         echo ""
         echo "restoring swap on $NBD_DEV..."
         mkswap "$NBD_DEV" >/dev/null
-        swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
+        if [ "${VRAM_COMPRESS:-0}" != "0" ]; then
+            swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}" --discard=pages
+        else
+            swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
+        fi
         echo "swap restored:"
         swapon --show
     fi
