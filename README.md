@@ -53,6 +53,7 @@ The NBD approach sidesteps all of this. `cuMemcpyHtoD` and `cuMemcpyDtoH` work o
 - Linux kernel 5.6+ recommended, since that is where `PR_SET_IO_FLUSHER` landed and the swap-deadlock protection leans on it, though older kernels still run with that one safeguard disabled (the `nbd` module itself is built into most distros)
 - `nbd-client` package
 - `gcc`, `make`
+- `liblz4.so.1` only if you enable `VRAM_COMPRESS=1` (`liblz4-1` / `lz4-libs`)
 
 ---
 
@@ -86,11 +87,23 @@ Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
 Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
 Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
+Environment=VRAM_COMPRESS=0            # 1 = lz4-compress pages in VRAM (needs liblz4)
+Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compress=1 (1.0-8.0)
 ```
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
 
 `VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` are auto-set to `nproc` at install and should match each other. More connections let the daemon drain concurrent swap I/O in parallel; the benefit saturates around your physical core count, and single-stream workloads do not use it at all (see Performance).
+
+### Compression
+
+Off by default. Set `VRAM_COMPRESS=1` to pack lz4-compressed 4K pages into the CUDA allocation, and advertise a larger NBD device (`VRAM_COMPRESS_RATIO` times the VRAM size, default 2.0x). `VRAM_COMPRESS_RATIO` accepts `X` or `X.Y` with one decimal place (range `1.0` to `8.0`, for example `2.5`). Same-filled pages (zeros) take no VRAM. Typical anonymous memory is around 2–3× with lz4, so 7 GiB of VRAM can back on the order of 14–21 GiB of swap if the data compresses; if it does not, writes return `ENOSPC` and the kernel can fall through to lower-priority swap (zram/SSD).
+
+This is not zswap (which caches compressed pages in system RAM) and not zram (which is RAM-backed). The compressed bytes live in VRAM. Cost is extra CPU per page fault and the loss of the 1:1 copy batching path. Requires `liblz4.so.1` (`liblz4-1` on Debian/Pop!_OS, `lz4-libs` on Fedora). The installer prompts for this; after a manual edit, `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
+
+When compression is on, `swapon --discard=pages` is used so freed swap slots TRIM and return VRAM to the pool. Without discard the pool would leak until those offsets are overwritten.
+
+Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
 

@@ -15,8 +15,10 @@
 set -e
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Remember a previously-installed VRAM allocation so a reinstall can default to it
+# Remember previously-installed knobs so a reinstall can default to them
 PREV_ALLOC=$(grep -oE 'VRAM_SETUP_SIZE_MB=[0-9]+' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | grep -oE '[0-9]+$' || true)
+PREV_COMPRESS=$(sed -n 's/^Environment=VRAM_COMPRESS=\([0-9][0-9]*\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
+PREV_RATIO=$(sed -n 's/^Environment=VRAM_COMPRESS_RATIO=\([0-9]\+\(\.[0-9]\)\?\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 
 echo "=== nbd-vram installer ==="
 echo "Source: $SRC_DIR"
@@ -81,6 +83,7 @@ echo "      OK"
 # Install binary and service
 echo "[3/4] Installing binaries and systemd unit..."
 install -m 755 "$SRC_DIR/nbd-vram"                          /usr/local/bin/nbd-vram
+install -m 755 "$SRC_DIR/nbd-vram-compression-status.sh"    /usr/local/bin/nbd-vram-compression-status.sh
 install -m 755 "$SRC_DIR/nbd-vram-connect.sh"               /usr/local/bin/nbd-vram-connect.sh
 install -m 755 "$SRC_DIR/nbd-vram-disconnect.sh"            /usr/local/bin/nbd-vram-disconnect.sh
 install -m 644 "$SRC_DIR/systemd/vram-swap-nbd.service"          /etc/systemd/system/
@@ -157,6 +160,71 @@ if [ -t 0 ]; then
     done
     sed -i "s/VRAM_SETUP_SIZE_MB=.*/VRAM_SETUP_SIZE_MB=${ALLOC}/" /etc/systemd/system/vram-swap-nbd.service
     echo "      VRAM allocation set to ${ALLOC} MiB"
+
+    echo ""
+    echo "lz4 compression packs swap pages in VRAM so the swap device can be larger"
+    echo "than the CUDA allocation (default 2.0x). Needs liblz4. Slightly more CPU per fault."
+    if [ "${PREV_COMPRESS:-0}" = "1" ]; then
+        printf "Enable lz4 compression of VRAM swap? [Y/n]: "
+        read -r COMP_REPLY || COMP_REPLY=""
+        if [ "$COMP_REPLY" = "n" ] || [ "$COMP_REPLY" = "N" ]; then
+            COMPRESS=0
+        else
+            COMPRESS=1
+        fi
+    else
+        printf "Enable lz4 compression of VRAM swap? [y/N]: "
+        read -r COMP_REPLY || COMP_REPLY=""
+        if [ "$COMP_REPLY" = "y" ] || [ "$COMP_REPLY" = "Y" ]; then
+            COMPRESS=1
+        else
+            COMPRESS=0
+        fi
+    fi
+    RATIO=${PREV_RATIO:-2.0}
+    if [ "$COMPRESS" = "1" ]; then
+        while :; do
+            printf "Compression ratio (logical size / VRAM, 1.0-8.0, one decimal) [%s]: " "$RATIO"
+            read -r RATIO_REPLY || RATIO_REPLY=""
+            RATIO_REPLY=${RATIO_REPLY:-$RATIO}
+            case "$RATIO_REPLY" in
+                [1-7]|[1-7].[0-9]|8|8.0) ;;
+                *)
+                echo "  please enter X or X.Y from 1.0 to 8.0 (examples: 2, 2.5, 7.9)"
+                continue
+                ;;
+            esac
+            if [ "$RATIO_REPLY" = "8" ]; then
+                RATIO_REPLY="8.0"
+            elif expr "$RATIO_REPLY" : '^[1-7]$' >/dev/null; then
+                RATIO_REPLY="${RATIO_REPLY}.0"
+            fi
+            RATIO=$RATIO_REPLY
+            break
+        done
+        if ! ldconfig -p 2>/dev/null | grep -q 'liblz4.so.1'; then
+            echo "      installing liblz4 (needed for VRAM_COMPRESS=1)..."
+            apt-get install -y liblz4-1 || {
+                echo "      warning: could not install liblz4-1; the service will fail to start until liblz4.so.1 is present" >&2
+            }
+        fi
+    fi
+    sed -i "s/^Environment=VRAM_COMPRESS=[0-9][0-9]*/Environment=VRAM_COMPRESS=${COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
+    sed -i "s/^Environment=VRAM_COMPRESS_RATIO=[0-9]\+\(\.[0-9]\)\?/Environment=VRAM_COMPRESS_RATIO=${RATIO}/" /etc/systemd/system/vram-swap-nbd.service
+    if [ "$COMPRESS" = "1" ]; then
+        EXPORT_MIB=$(awk -v a="$ALLOC" -v r="$RATIO" 'BEGIN { printf "%d", a * r }')
+        echo "      lz4 compression on, ratio ${RATIO} (${ALLOC} MiB VRAM -> ${EXPORT_MIB} MiB swap)"
+    else
+        echo "      lz4 compression off (1:1 VRAM mapping)"
+    fi
+else
+    # Non-interactive reinstall: keep previous compress knobs if present
+    if [ -n "$PREV_COMPRESS" ]; then
+        sed -i "s/^Environment=VRAM_COMPRESS=[0-9][0-9]*/Environment=VRAM_COMPRESS=${PREV_COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
+    fi
+    if [ -n "$PREV_RATIO" ]; then
+        sed -i "s/^Environment=VRAM_COMPRESS_RATIO=[0-9]\+\(\.[0-9]\)\?/Environment=VRAM_COMPRESS_RATIO=${PREV_RATIO}/" /etc/systemd/system/vram-swap-nbd.service
+    fi
 fi
 
 # Enable and (re)start
@@ -197,6 +265,7 @@ echo ""
 echo "To check status:"
 echo "  systemctl status vram-swap-nbd"
 echo "  swapon --show"
+echo "  nbd-vram-compression-status.sh"
 echo "  journalctl -u vram-swap-nbd -n 20"
 echo ""
 echo "To uninstall:"
