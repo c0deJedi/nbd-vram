@@ -1,0 +1,5 @@
+# Trigger power state check when AC adapter is plugged or unplugged.
+# OpenRC version: calls nbd-vram-power-check.sh directly instead of via systemd.
+# ATTR{type}=="Mains" matches AC0, AC, ADP1, etc. across hardware.
+ACTION=="change", SUBSYSTEM=="power_supply", ATTR{type}=="Mains", \
+    RUN+="/usr/local/bin/nbd-vram-power-check.sh"

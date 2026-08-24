@@ -1,0 +1,16 @@
+# /etc/conf.d/nbd-vram-swap - Configuration for the nbd-vram OpenRC service
+# Edit these values before starting the service for the first time.
+# See also: /etc/nbd-vram.conf for power management settings.
+
+# VRAM to allocate for swap, in MiB.
+# Leave headroom for the GPU's own use.  Example: RTX 3070 (8 GB) -> 7168
+VRAM_SETUP_SIZE_MB=7168
+
+# Swap priority (higher = kernel prefers this swap over RAM-backed swap).
+# 1500 is very high; the kernel uses VRAM swap first before touching RAM swap.
+VRAM_SWAP_PRIORITY=1500
+
+# NBD server worker threads and client connections.
+# Rule of thumb: set both to the number of CPU cores (nproc).
+VRAM_NBD_THREADS=4
+VRAM_NBD_CONNECTIONS=4

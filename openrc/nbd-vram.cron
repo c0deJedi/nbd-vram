@@ -1,0 +1,4 @@
+# /etc/cron.d/nbd-vram
+# Battery/AC power check every minute — replaces nbd-vram-battery-watch.timer for OpenRC.
+# No-op when VRAM_POWER_MANAGEMENT=0 in /etc/nbd-vram.conf (the default).
+* * * * * root /usr/local/bin/nbd-vram-power-check.sh

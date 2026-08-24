@@ -1,0 +1,64 @@
+#!/sbin/openrc-run
+# /etc/init.d/nbd-vram-swap - OpenRC service for VRAM swap via NBD
+# Install via: install -m 755 openrc/nbd-vram-swap.initd /etc/init.d/nbd-vram-swap
+#              install -m 644 openrc/nbd-vram-swap.confd  /etc/conf.d/nbd-vram-swap
+
+description="VRAM Swap via NBD (CUDA memcpy backend)"
+command="/usr/local/bin/nbd-vram"
+command_background="yes"
+pidfile="/run/nbd-vram-swap.pid"
+output_log="/var/log/nbd-vram-swap.log"
+error_log="/var/log/nbd-vram-swap.log"
+
+# Defaults — overridden by /etc/conf.d/nbd-vram-swap (sourced by OpenRC before this file)
+: ${VRAM_SETUP_SIZE_MB:=7168}
+: ${VRAM_SWAP_PRIORITY:=1500}
+: ${VRAM_NBD_THREADS:=4}
+: ${VRAM_NBD_CONNECTIONS:=4}
+# Export at top level so nbd-vram-connect.sh (called from start_post) inherits them
+export VRAM_SETUP_SIZE_MB VRAM_SWAP_PRIORITY VRAM_NBD_THREADS VRAM_NBD_CONNECTIONS
+
+depend() {
+	# nbd kernel module must load before we try to claim an nbd device
+	# Start after the display manager so the GPU is initialized for CUDA
+	# (PRIME offload needs X to claim the GPU first on hybrid laptops)
+	after modules xdm
+	use logger
+}
+
+start_pre() {
+	# Wake GPU to avoid GSP RPC timeout (Xid 119 on laptops with PRIME offload)
+	nvidia-smi -pm 1 || true
+	# Swap aggressively; reset on stop by nbd-vram-disconnect.sh
+	sysctl -w vm.swappiness=200 vm.min_free_kbytes=524288
+}
+
+start_post() {
+	# Daemon signals readiness via sd_notify; without systemd, poll for the socket
+	local timeout=60
+	while [ "${timeout}" -gt 0 ]; do
+		[ -S /run/nbd-vram.sock ] && break
+		sleep 1
+		: $(( timeout -= 1 ))
+	done
+	[ -S /run/nbd-vram.sock ] || { eerror "nbd-vram socket not ready after 60s"; return 1; }
+	/usr/local/bin/nbd-vram-connect.sh || return 1
+	# Protect daemon from OOM killer (matches OOMScoreAdjust=-1000 in the systemd unit)
+	[ -r "${pidfile}" ] && \
+		echo -1000 > "/proc/$(cat "${pidfile}")/oom_score_adj" 2>/dev/null || true
+}
+
+stop_pre() {
+	# Disconnect swap first; abort stop on failure to avoid live-swap-page corruption
+	# (see the TimeoutStopSec/SendSIGKILL=no rationale in systemd/vram-swap-nbd.service)
+	/usr/local/bin/nbd-vram-disconnect.sh || return 1
+}
+
+stop() {
+	ebegin "Stopping ${RC_SVCNAME}"
+	# Long TERM-only timeout: mirrors TimeoutStopSec=1800 + SendSIGKILL=no.
+	# Killing the daemon while swap pages are live causes memory corruption.
+	start-stop-daemon --stop --quiet --pidfile "${pidfile}" \
+		--retry TERM/1800 --oknodo
+	eend $?
+}
