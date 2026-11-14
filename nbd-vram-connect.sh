@@ -5,11 +5,36 @@ set -e
 
 modprobe nbd max_part=0 2>/dev/null || true
 
+# Disconnect can return while a block-device opener still holds the old kernel
+# configuration. Wait for its release before reconnecting, not just a missing pid.
+disconnect_nbd() {
+    local dev=$1 status attempt
+    nbd-client -d "$dev" 2>/dev/null || true
+    for attempt in {1..200}; do
+        if nbd-client -c "$dev" >/dev/null 2>&1; then
+            sleep 0.05
+        else
+            status=$?
+            if [ "$status" -eq 1 ]; then
+                return 0
+            fi
+            echo "nbd-vram-connect: cannot check disconnect status for $dev" >&2
+            return 1
+        fi
+    done
+    echo "nbd-vram-connect: timed out waiting for $dev to disconnect" >&2
+    return 1
+}
+
 # Clean up any device left over from a previous unclean shutdown
 if [ -f /run/nbd-vram-dev ]; then
     PREV=$(cat /run/nbd-vram-dev)
-    swapoff "$PREV" 2>/dev/null || true
-    nbd-client -d "$PREV" 2>/dev/null || true
+    ACTIVE_SWAPS=$(swapon --show=NAME --noheadings --raw)
+    if grep -Fxq -- "$PREV" <<< "$ACTIVE_SWAPS" && ! swapoff "$PREV"; then
+        echo "nbd-vram-connect: swapoff $PREV FAILED - preserving device and state" >&2
+        exit 1
+    fi
+    disconnect_nbd "$PREV"
     rm -f /run/nbd-vram-dev
 fi
 
@@ -31,7 +56,7 @@ fi
 
 echo "nbd-vram-connect: using $NBD_DEV"
 # Force-disconnect to clear any stale kernel state from an unclean previous shutdown
-nbd-client -d "$NBD_DEV" 2>/dev/null || true
+disconnect_nbd "$NBD_DEV"
 nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections ${VRAM_NBD_CONNECTIONS:-4}
 mkswap "$NBD_DEV"
 swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
