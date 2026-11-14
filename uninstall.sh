@@ -13,6 +13,7 @@ echo "      OK"
 
 echo "[2/4] Removing binaries..."
 rm -f /usr/local/bin/nbd-vram
+rm -f /usr/local/bin/nbd-vram-compression-status.sh
 rm -f /usr/local/bin/nbd-vram-connect.sh
 rm -f /usr/local/bin/nbd-vram-disconnect.sh
 rm -f /usr/local/bin/nbd-vram-power-check.sh

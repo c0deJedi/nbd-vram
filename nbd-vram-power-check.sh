@@ -54,9 +54,11 @@ if [ "$SHOULD_DISABLE" = "1" ]; then
 else
     # Only auto-start if this script previously auto-stopped it.
     # Never auto-start after a manual 'systemctl stop'.
+    # Never start a disabled unit - enable/disable is the sole on/off switch.
     if [ -f "$STATE_FILE" ] && ! systemctl is-active --quiet vram-swap-nbd; then
-        echo "nbd-vram-power-check: re-enabling VRAM swap (AC_ONLINE=$AC_ONLINE battery=${BATTERY_CAP}%)" >&2
         rm -f "$STATE_FILE"
+        systemctl is-enabled --quiet vram-swap-nbd || exit 0
+        echo "nbd-vram-power-check: re-enabling VRAM swap (AC_ONLINE=$AC_ONLINE battery=${BATTERY_CAP}%)" >&2
         systemctl start vram-swap-nbd
     fi
 fi

@@ -53,6 +53,8 @@ The NBD approach sidesteps all of this. `cuMemcpyHtoD` and `cuMemcpyDtoH` work o
 - Linux kernel 5.6+ recommended, since that is where `PR_SET_IO_FLUSHER` landed and the swap-deadlock protection leans on it, though older kernels still run with that one safeguard disabled (the `nbd` module itself is built into most distros)
 - `nbd-client` package
 - `gcc`, `make`
+- `liblz4.so.1` only for `VRAM_COMPRESS=lz4` (`liblz4-1` / `lz4-libs`)
+- `libzstd.so.1` only for `VRAM_COMPRESS=zstd` or `zstd:LEVEL` (`libzstd1` / `libzstd`)
 
 ---
 
@@ -73,7 +75,7 @@ swapon --show
 # /dev/nbd0  partition   7G   0B 1500
 ```
 
-The service is enabled on install, so it comes up automatically on every boot.
+The installer asks whether to enable the service at boot, defaulting to its current setting (no on a fresh install). Non-interactive installs preserve that setting. The installer also starts or restarts the service immediately, regardless of the boot-start choice.
 
 ---
 
@@ -84,15 +86,80 @@ Edit `/etc/systemd/system/vram-swap-nbd.service`:
 ```ini
 Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
-Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
-Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
+Environment=VRAM_NBD_THREADS=2         # worker threads; default favors desktop responsiveness
+Environment=VRAM_NBD_CONNECTIONS=2     # nbd connections; keep equal to threads
+Environment=VRAM_CUDA_SCHED=blocking   # blocking (default), or auto for comparison
+Environment=VRAM_COMPRESS=off          # off, lz4, zstd, or zstd:LEVEL (1-22)
+Environment=VRAM_DEDUP=0              # 1 = share identical pages (optional)
+Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compression or dedup is enabled (1.0-8.0)
 ```
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
 
-`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` are auto-set to `nproc` at install and should match each other. More connections let the daemon drain concurrent swap I/O in parallel; the benefit saturates around your physical core count, and single-stream workloads do not use it at all (see Performance).
+`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` default to **2** and should match each other (range 1–64). More connections allow more simultaneous swap I/O, but can compete with the compositor for CPU time, GPU memory bandwidth, and device queues. Fresh installs use 2; interactive and non-interactive reinstalls preserve valid counts from the existing service file. Missing or invalid counts use the template default. Settings in systemd overrides are also retained; use `systemctl edit vram-swap-nbd.service` to keep custom settings separate from the installed unit.
+
+### Desktop responsiveness
+
+The defaults favor small bursts and fewer concurrent transfers. CUDA synchronization uses `VRAM_CUDA_SCHED=blocking` so waiting workers sleep; CUDA's `auto` policy can spin on the CPU. See [NVIDIA's synchronization documentation](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__STREAM.html). `VRAM_CUDA_SCHED=auto` restores the previous wait policy for comparison. This setting controls CPU waiting, not graphics priority or copy-engine preemption.
+
+With batching enabled, a worker collects at most `VRAM_BATCH_DEPTH` complete requests (default **8**, maximum 256) and **64 KiB total payload**, whichever comes first. It never waits for an incomplete additional header or write payload. Direction changes finish the current batch and send its replies first, so a read is answered before later writes are submitted. Large requests also transfer in 64 KiB chunks, completing each chunk before submitting the next. The daemon reserves 64 KiB for the batch buffer and 64 KiB for the per-request buffer per worker, plus codec staging when enabled.
+
+These limits bound submitted work, not wall-clock latency; GPU scheduling and system memory pressure still matter. They may reduce maximum throughput. Compare pointer/compositor smoothness and high-percentile swap latency under the same workload before increasing concurrency. For an existing installation, apply the two connection settings above as well as installing the new binary. On a GPU driving the display, leave enough VRAM free for the compositor and applications: successfully allocating swap VRAM alone does not establish that the remaining headroom is sufficient.
+
+### Compression
+
+Off by default (`VRAM_COMPRESS=off`). Set `VRAM_COMPRESS=lz4` or `VRAM_COMPRESS=zstd:3` to pack compressed 4K pages into the CUDA allocation, and advertise a larger NBD device (`VRAM_COMPRESS_RATIO` times the VRAM size, default 2.0x). `VRAM_COMPRESS_RATIO` accepts `X` or `X.Y` with one decimal place (range `1.0` to `8.0`, for example `2.5`). Same-filled pages (zeros) take no VRAM. Typical anonymous memory is around 2–3× with lz4, so 7 GiB of VRAM can back on the order of 14–21 GiB of swap if the data compresses; if it does not, writes return `ENOSPC` and the kernel can fall through to lower-priority swap (zram/SSD).
+
+This is not zswap (which caches compressed pages in system RAM) and not zram (which is RAM-backed). The compressed bytes live in VRAM. Compression adds CPU work per page fault. LZ4 requires `liblz4.so.1` (`liblz4-1` on Debian/Pop!_OS, `lz4-libs` on Fedora); Zstandard requires `libzstd.so.1` (`libzstd1` on Debian/Pop!_OS, `libzstd` on Fedora). Only the selected library is loaded; no codec development headers are needed to build. The installer prompts for this; after a manual edit, `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
+
+Use `VRAM_COMPRESS=zstd:LEVEL` for a Zstandard level from **1 to 22**, for example:
+
+```ini
+Environment=VRAM_COMPRESS=zstd:3
+Environment=VRAM_COMPRESS_RATIO=2.0
+```
+
+`zstd` alone defaults to level 3. Legacy `0` (off) and `1` (lz4) remain accepted; the installer saves the named values. Higher levels spend more CPU on compression and can increase swap-write latency; the level does not change the advertised device size. `VRAM_COMPRESS_RATIO` controls that size separately. Invalid codec names or levels fail startup. Pages that do not shrink are stored uncompressed. The codec and level are fixed until the service restarts; the installer preserves them on reinstall.
+
+When compression or deduplication is on, `swapon --discard=pages` is used so freed swap slots TRIM and return VRAM to the pool. Without discard the pool would leak until those offsets are overwritten.
+
+The packed store reserves and touches its page table, slab records, and slot bitmaps at startup. Slab metadata uses about 4.3 MiB of system RAM per GiB of VRAM; creating or recycling slabs during I/O does not allocate host memory. Each size class keeps a list of slabs with free slots. If its own slots and all unused slabs are exhausted, a page can use a free slot from a larger class before returning `ENOSPC`. Accounting and TRIM use the actual slot size. This fallback helps with fragmentation but cannot combine smaller holes into a larger slot.
+
+Request batching also works with compression and deduplication. `VRAM_BATCH=1` (default) uses the request and byte limits above. Aligned requests of the same direction share device synchronization; overlapping pages, colliding lock stripes, and partial requests split storage groups. FLUSH, TRIM, and oversized requests finish earlier batches first. `VRAM_BATCH=0` processes requests individually while retaining the 64 KiB transfer chunks.
+
+Readers share page locks; writes and TRIM take exclusive locks. Batches acquire lock stripes in a fixed order to avoid deadlocks across connections, and full-page compression happens before taking those locks. A successful write is visible to other connections before its reply is sent. Failed transfers are drained before reservations are recycled, and failed write groups preserve their previous mappings.
+
+With dedup off, full-page writes also reserve slots and finish GPU uploads before acquiring page locks. Other connections can read the existing data during that upload, even when their pages share a lock stripe. At commit, the writer replaces the current mapping under the lock; an intervening overwrite or TRIM is accounted for at that point. Partial writes retain the lock throughout read/modify/write, and dedup writes retain their existing locking. Readers release page locks as soon as downloads finish and decompress from private staging buffers, including for partial reads.
+
+Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows the codec and level, configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
+
+### Page deduplication
+
+Set `VRAM_DEDUP=1` to store identical 4 KiB pages once, with reference counting:
+
+```ini
+Environment=VRAM_COMPRESS=zstd:3
+Environment=VRAM_DEDUP=1
+Environment=VRAM_COMPRESS_RATIO=2.0
+```
+
+Off by default. The installer offers `Page deduplication (off, on)` and preserves the setting on reinstall. Deduplication works with LZ4, Zstandard, or `VRAM_COMPRESS=off`; raw pages that do not compress can also share storage. With deduplication alone, `VRAM_COMPRESS_RATIO` still controls logical device size. Changes take effect after a service restart.
+
+A hash finds candidates, then the daemon reads the candidate from VRAM and compares all 4096 original bytes. Pages already prepared in the same batch can be compared directly in host memory. Hash collisions cannot merge different pages. New unique payloads upload together with one synchronization before their mappings are published; matching existing VRAM objects still requires downloads and synchronization. Shared payloads are immutable: overwriting or partially modifying a page changes only its own reference. TRIM or overwrite frees a payload when its final reference is removed. Same-filled pages already take no VRAM and are excluded from deduplication counts.
+
+`nbd-vram-compression-status.sh` adds:
+
+- **deduped pages**: current extra copies avoided. Three pages sharing one payload count as two deduped pages. This is a subset of the existing page totals, not an additional page type.
+- **dedup savings**: object-slot bytes avoided after compression, including size-class rounding. This does not imply the same number of whole slabs became free.
+- **dedup matches**: successful page writes that reused an existing payload since startup, including rewriting a page with identical contents. Failed batches do not increase this counter.
+- **dedup index RAM**: reserved memory for the lookup table, per-page references, and the entire payload-record pool, including unused records (excluding allocator overhead).
+- **dedup net savings**: VRAM object storage saved minus system RAM used by the index, displayed in MiB. Can be negative when the index costs more than deduplication saves.
+
+Deduplication adds CPU hashing, VRAM reads to verify candidates, and host RAM metadata. Dedup write commits are serialized while verifying and updating references; ordinary reads still run in parallel. These costs can reduce throughput, so enable it when repeated pages save enough space.
+
+On 64-bit systems, the index reserves 8 bytes per logical page, a hash table of up to 8 MiB, and 48 bytes per payload object in a pool allocated at startup. The pool holds at most one object per logical page plus 32 pending replacements, capped by the number of payloads that can physically fit in VRAM (4096-byte slots without compression, 32-byte slots with compression). Objects return to this pool on TRIM, overwrite, or rollback; writes do not allocate or free dedup metadata from the host heap. The startup log and `dedup index RAM` status report the full reservation, including unused objects. This moves the RAM cost to startup, where allocation failure prevents the daemon from starting, and the existing memory locking keeps the metadata resident.
 
 ---
 
@@ -120,6 +187,8 @@ If you want to use the GPU heavily at the same time, pick one:
 
 **Leave headroom** choose a smaller allocation when the installer asks, or change `VRAM_SETUP_SIZE_MB` in `/etc/systemd/system/vram-swap-nbd.service` later (e.g. `4096` keeps 4 GB for the GPU).
 
+The installer lets you exceed its recommendation while leaving 1024 MiB for the GPU. For example, a 4096 MiB GPU can allocate 3072 MiB to swap, including when it drives a display.
+
 **Stop it while you need the card** `sudo systemctl stop vram-swap-nbd`, then start it again afterwards. Swapped pages migrate back to RAM and other swap first.
 
 This is the natural trade-off of swapping to VRAM: it is free memory, right up until you want the GPU for something else.
@@ -127,6 +196,29 @@ This is the natural trade-off of swapping to VRAM: it is free memory, right up u
 ---
 
 ## Smoke test (without installing)
+
+CPU-only allocator, compression, and deduplication regression tests (requires both runtime codec libraries and Python 3):
+
+```sh
+make test
+```
+
+These use simulated VRAM and do not activate swap. They cover larger-slot fallback, allocator churn, metadata allocation failures at startup, rollback, and storage operations with metadata heap calls forbidden. Batching tests defer device copies until synchronization, inject transfer failures, exercise concurrent readers/writers/TRIM, and drive the NBD handshake and request loop over local socket pairs. Both direct and packed storage are covered, including byte limits, large-write buffer lifetime, replies before later writes, fragmented headers/payloads, request ordering, and visibility across connections. Tests pause uploads and decompression to check reader progress, mapping changes during an upload, and safe slot reuse after a download. The socket tests require permission to send and receive over local sockets.
+
+### GPU contention benchmark
+
+```sh
+make bench-contention BENCH_ARGS='lz4 10000 alias'
+make bench-contention BENCH_ARGS='lz4 10000 disjoint'
+```
+
+This standalone benchmark owns 16 MiB of VRAM on GPU 0 and runs a 4 KiB reader alongside a writer issuing 64 KiB batches, with dedup off and blocking CUDA waits. It does not attach an NBD device or change the running swap service. It requires GPU access and the selected codec library; `zstd:1` and other supported Zstd levels also work. The `alias` case uses different pages sharing lock stripes; `disjoint` provides a control using different stripes. Each run stops after the requested read count or 10 seconds (with a 30-second watchdog).
+
+It reports p50/p99/p99.9/max read latency, counts above 1/5/10 ms, and reader/writer throughput. Results use synthetic compressible pages and measure the storage functions directly: they exclude NBD queuing, kernel reclaim, and desktop frame timing. To compare revisions, compile this same benchmark with `NBD_VRAM_SOURCE` defined as a quoted path to the other revision's `nbd-vram.c`.
+
+### GPU/NBD smoke test
+
+For a test that attaches an NBD device and activates swap:
 
 ```sh
 sudo bash test-nbd.sh

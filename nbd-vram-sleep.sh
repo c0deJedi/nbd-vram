@@ -26,6 +26,8 @@ case "$1" in
         if [ -f "$STATE_FILE" ]; then
             echo "nbd-vram-sleep: restoring VRAM swap after resume" >&2
             rm -f "$STATE_FILE"
+            # Never start a disabled unit - enable/disable is the sole on/off switch.
+            systemctl is-enabled --quiet vram-swap-nbd.service || exit 0
             # Fresh daemon -> fresh CUDA context (ExecStartPre wakes the GPU itself).
             systemctl start vram-swap-nbd.service
         fi

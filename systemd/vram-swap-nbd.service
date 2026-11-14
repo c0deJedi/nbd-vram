@@ -14,14 +14,29 @@ NotifyAccess=main
 # RTX 3070 (8GB): 7168 leaves ~1GB for display/compute.
 Environment=VRAM_SETUP_SIZE_MB=7168
 Environment=VRAM_SWAP_PRIORITY=1500
-Environment=VRAM_NBD_THREADS=4
-Environment=VRAM_NBD_CONNECTIONS=4
+# Keep GPU/CPU contention low when this GPU also drives the desktop.
+Environment=VRAM_NBD_THREADS=2
+Environment=VRAM_NBD_CONNECTIONS=2
+# CPU wait policy: blocking (default) sleeps until GPU work finishes; auto lets CUDA choose and may busy-wait, using more CPU.
+Environment=VRAM_CUDA_SCHED=blocking
+# Compression: off, lz4, zstd, or zstd:LEVEL (1-22).
+# zstd defaults to level 3. Needs liblz4.so.1 or libzstd.so.1 for the chosen codec.
+Environment=VRAM_COMPRESS=off
+# Share identical pages with reference counting. Independent of compression.
+# Dedup adds RAM and verification overhead; write commits are serialized.
+Environment=VRAM_DEDUP=0
+# Logical swap size / physical VRAM when compression or dedup is enabled (1.0-8.0, default 2.0).
+Environment=VRAM_COMPRESS_RATIO=2.0
 
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1
-# Swap aggressively before RAM fills so the kernel never runs out of memory
-# to process swap requests. Reset on stop by nbd-vram-disconnect.sh.
-ExecStartPre=/sbin/sysctl -w vm.swappiness=200 vm.min_free_kbytes=524288
+# Keep 512 MiB of free-memory headroom for userspace swap I/O.
+# Reset on stop by nbd-vram-disconnect.sh.
+# TBD testing (provisional): trial 100 instead of 200 to reduce preference for
+# swapping application pages over reclaiming file cache. Validate responsiveness
+# and memory pressure under load before settling on this value.
+# ExecStartPre=/sbin/sysctl -w vm.swappiness=200 vm.min_free_kbytes=524288
+ExecStartPre=/sbin/sysctl -w vm.swappiness=100 vm.min_free_kbytes=524288
 
 ExecStart=/usr/local/bin/nbd-vram
 ExecStartPost=/usr/local/bin/nbd-vram-connect.sh

@@ -3,6 +3,10 @@
  * Implements NBD fixed-newstyle protocol over a Unix socket.
  * No NVIDIA P2P or kernel symbols needed - uses cuMemcpyHtoDAsync/DtoHAsync.
  *
+ * Optional lz4/zstd compression and exact page deduplication pack swap pages
+ * in VRAM so the NBD export can be larger than the CUDA allocation.
+ * Loads the selected codec at runtime; deduplication also works without a codec.
+ *
  * Compile: gcc -O2 -o nbd-vram nbd-vram.c -ldl -lpthread
  */
 
@@ -15,6 +19,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -43,6 +48,7 @@ typedef struct CUstream_st *CUstream;
 
 #define CUDA_SUCCESS           0
 #define CU_CTX_SCHED_AUTO      0
+#define CU_CTX_SCHED_BLOCKING_SYNC 4
 #define CU_STREAM_NON_BLOCKING 1
 
 typedef CUresult (*pfn_cuInit)(unsigned int);
@@ -161,6 +167,7 @@ static const char *cuda_err(CUresult r) {
 /* Transmission flags (per-export) */
 #define NBD_FLAG_HAS_FLAGS      0x0001
 #define NBD_FLAG_SEND_FLUSH     0x0004
+#define NBD_FLAG_SEND_TRIM      0x0020
 #define NBD_FLAG_CAN_MULTI_CONN 0x0100
 
 /* Transmission request magic */
@@ -261,7 +268,7 @@ static int send_export_info(int fd, uint32_t opt, uint64_t size, uint16_t tx_fla
  * NBD fixed-newstyle handshake
  * ---------------------------------------------------------------------- */
 
-static int nbd_handshake(int fd, uint64_t vram_size)
+static int nbd_handshake(int fd, uint64_t export_size, int send_trim)
 {
     /* Phase 1: server greeting */
     struct {
@@ -300,6 +307,8 @@ static int nbd_handshake(int fd, uint64_t vram_size)
         if (opt_len > 65536) return -1;
 
         uint16_t tx_flags = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_CAN_MULTI_CONN;
+        if (send_trim)
+            tx_flags |= NBD_FLAG_SEND_TRIM;
 
         switch (opt) {
         case NBD_OPT_EXPORT_NAME:
@@ -311,7 +320,7 @@ static int nbd_handshake(int fd, uint64_t vram_size)
                     uint64_t size;
                     uint16_t tx_flags;
                 } __attribute__((packed)) info;
-                info.size     = htobe64(vram_size);
+                info.size     = htobe64(export_size);
                 info.tx_flags = htons(tx_flags);
                 if (send_all(fd, &info, sizeof(info)) != 0) return -1;
                 if (!no_zeroes) {
@@ -324,7 +333,7 @@ static int nbd_handshake(int fd, uint64_t vram_size)
         case NBD_OPT_GO:
         case NBD_OPT_INFO:
             if (drain(fd, opt_len) != 0) return -1;
-            if (send_export_info(fd, opt, vram_size, tx_flags) != 0) return -1;
+            if (send_export_info(fd, opt, export_size, tx_flags) != 0) return -1;
             if (send_opt_reply(fd, opt, NBD_REP_ACK, NULL, 0) != 0) return -1;
             if (opt == NBD_OPT_GO)
                 return 0;  /* transmission begins */
@@ -362,20 +371,26 @@ static int nbd_handshake(int fd, uint64_t vram_size)
 #define DEFAULT_SIZE_MB 7168
 #define SIZE_ALIGN      (64 * 1024)
 #define SOCK_PATH       "/run/nbd-vram.sock"
-#define IO_BUF_SIZE     (4 * 1024 * 1024)
+#define IO_BUF_SIZE     (64 * 1024)
 #define NBD_THREADS_MAX     64
-#define NBD_THREADS_DEFAULT  4
+#define NBD_THREADS_DEFAULT  2
 
-/* Request-level batching: drain up to N already-queued requests, issue all their
- * VRAM copies, then ONE cuStreamSynchronize for the whole batch. Amortises both
- * the per-op socket round-trip and the per-op CUDA launch+sync (the two halves of
- * the small-IO floor). Requests larger than a slot fall back to the per-op path. */
+/* Bound both request count and bytes queued before replying. Small bursts limit
+ * copy-engine occupancy on GPUs also driving a display. Larger requests use
+ * the per-op path, synchronizing each IO_BUF_SIZE chunk before submitting more. */
 #define BATCH_SLOT          (64 * 1024)   /* max per-request size that batches */
-#define BATCH_DEPTH_DEFAULT 32
+#define BATCH_BYTES_MAX     (64 * 1024)   /* total payload per worker/batch */
+#define BATCH_DEPTH_DEFAULT 8
 #define BATCH_DEPTH_MAX     256
 
 static CUdeviceptr  g_vram_ptr;
 static uint64_t     g_vram_size;
+static uint64_t     g_export_size;           /* logical NBD size, may exceed physical VRAM */
+enum compression { COMP_OFF, COMP_LZ4, COMP_ZSTD };
+static int          g_compress;              /* enum compression */
+static int          g_dedup;                 /* VRAM_DEDUP=1 */
+static int          g_compress_level = 3;     /* zstd level, 1..22 */
+static int          g_compress_ratio_tenths = 20; /* VRAM_COMPRESS_RATIO in 0.1x units */
 static CUcontext    g_cu_ctx;
 static int          g_listen_fd  = -1;
 static volatile int g_running    = 1;
@@ -390,6 +405,68 @@ static unsigned long g_batch_ops     = 0;                  /* ops in those n>1 f
 static unsigned long g_flush_count   = 0;                  /* every batched-path flush, incl n==1 */
 static unsigned long g_flush_ops     = 0;                  /* ops across all flushes (true depth) */
 static unsigned long g_legacy_ops    = 0;                  /* READ/WRITE via the per-op path */
+
+/* Keep the original 0/1 interface while allowing an explicit codec and level. */
+static int parse_compression(const char *s, int *codec, int *level)
+{
+    int c = COMP_OFF, l = 3;
+    if (!s || strcmp(s, "off") == 0 || strcmp(s, "0") == 0) {
+        c = COMP_OFF;
+    } else if (strcmp(s, "1") == 0 || strcmp(s, "lz4") == 0) {
+        c = COMP_LZ4;
+    } else if (strcmp(s, "zstd") == 0) {
+        c = COMP_ZSTD;
+    } else if (strncmp(s, "zstd:", 5) == 0) {
+        const char *p = s + 5;
+        if (*p < '1' || *p > '9') return -1;
+        l = 0;
+        for (; *p; p++) {
+            if (*p < '0' || *p > '9') return -1;
+            l = l * 10 + (*p - '0');
+            if (l > 22) return -1;
+        }
+        c = COMP_ZSTD;
+    } else {
+        return -1;
+    }
+    *codec = c;
+    *level = l;
+    return 0;
+}
+
+static const char *compression_name(void)
+{
+    return g_compress == COMP_ZSTD ? "zstd" : g_compress == COMP_LZ4 ? "lz4" : "off";
+}
+
+static int packed_store_enabled(void)
+{
+    return g_compress != COMP_OFF || g_dedup;
+}
+
+/* Parse X or X.Y where X is 1..8 and Y is one decimal digit. */
+static int parse_ratio_tenths(const char *s, int *out)
+{
+    if (!s || !*s) return -1;
+    const char *p = s;
+    int whole = 0;
+    while (*p >= '0' && *p <= '9') {
+        whole = whole * 10 + (*p - '0');
+        p++;
+    }
+    int frac = 0;
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return -1;
+        frac = *p - '0';
+        p++;
+    }
+    if (*p != '\0') return -1;
+    int tenths = whole * 10 + frac;
+    if (tenths < 10 || tenths > 80) return -1;
+    *out = tenths;
+    return 0;
+}
 
 static int clients_connected(void) {
     for (int i = 0; i < g_nbd_threads; i++)
@@ -441,26 +518,1122 @@ struct bop {
     char    *slot;     /* host staging memory for this op */
 };
 
-/* Overflow-safe bounds check against the VRAM device. Written as
+/* Overflow-safe bounds check against the NBD export. Written as
  * offset > size || length > size - offset so that a near-2^64 offset cannot wrap
  * the sum and slip past, which the naive offset + length > size would allow. */
 static inline int oob(uint64_t offset, uint32_t length) {
-    return offset > g_vram_size || (uint64_t)length > g_vram_size - offset;
+    return offset > g_export_size || (uint64_t)length > g_export_size - offset;
 }
 
-/* Read a full 28-byte request header WITHOUT blocking if none is queued. The
- * first byte(s) decide: nothing queued -> 0 (adaptive batch cutoff); a header
- * began arriving -> finish it blocking to stay frame-aligned. */
-static int recv_hdr_nb(int fd, struct nbd_req_hdr *h)
+/* -------------------------------------------------------------------------
+ * Optional packed VRAM store (compression and/or deduplication)
+ *
+ * Logical 4K pages are packed into the CUDA allocation. The NBD export is
+ * VRAM_COMPRESS_RATIO times the physical size. Same-filled pages (zeros) take
+ * no VRAM. TRIM frees slots so the pool can refill; swapon --discard=pages.
+ * ---------------------------------------------------------------------- */
+
+#define COMP_PAGE    4096
+#define COMP_BATCH   32
+#define SLAB_SZ      (64 * 1024)
+#define NPLOCK       1024
+#ifndef STATUS_PATH
+#define STATUS_PATH  "/run/nbd-vram.status"
+#endif
+#define STATUS_TMP   STATUS_PATH ".tmp"
+
+#define PTE_NONE       0
+#define PTE_COMPRESSED 1
+#define PTE_RAW        2
+#define PTE_SAME       3
+
+static const uint16_t k_class_sz[] = {
+    32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448,
+    512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096
+};
+#define NCLASS ((int)(sizeof(k_class_sz) / sizeof(k_class_sz[0])))
+#define SLAB_NONE UINT32_MAX
+#define SLAB_BITMAP_BYTES ((SLAB_SZ / 32 + 7) / 8)
+
+struct pte {
+    uint64_t vram_off;
+    uint16_t clen;
+    uint8_t  kind;
+    uint8_t  fill;
+    uint8_t  klass;
+};
+
+struct slab {
+    uint32_t chunk;
+    uint32_t next, prev; /* partial-class list; next also links unused slabs */
+    uint16_t nobj;
+    uint16_t nfree;
+    uint16_t hint;
+    uint8_t  klass;
+    uint8_t bm[SLAB_BITMAP_BYTES]; /* sized for the smallest class; 1 = in use */
+};
+
+struct cpend {
+    const char *plain; /* valid until commit, used for exact dedup comparison */
+    uint64_t hash;
+    uint64_t pg;
+    uint64_t new_off;
+    uint64_t old_off;
+    uint16_t clen;
+    uint8_t  kind, fill, klass, slot;
+    uint8_t  old_kind, old_klass;
+};
+
+struct rpend {
+    uint64_t pg;
+    uint64_t vram_off;
+    char *dst;
+    uint16_t clen;
+    uint8_t  kind, slot;
+};
+
+typedef int (*pfn_LZ4_compress_default)(const char *, char *, int, int);
+typedef int (*pfn_LZ4_decompress_safe)(const char *, char *, int, int);
+
+static void                      *g_liblz4;
+static pfn_LZ4_compress_default   _LZ4_compress_default;
+static pfn_LZ4_decompress_safe    _LZ4_decompress_safe;
+
+/* Opaque stable-API types keep codec development headers optional. */
+typedef struct ZSTD_CCtx_s ZSTD_CCtx;
+typedef struct ZSTD_DCtx_s ZSTD_DCtx;
+static void *g_libzstd;
+static ZSTD_CCtx *(*_ZSTD_createCCtx)(void);
+static ZSTD_DCtx *(*_ZSTD_createDCtx)(void);
+static size_t (*_ZSTD_freeCCtx)(ZSTD_CCtx *);
+static size_t (*_ZSTD_freeDCtx)(ZSTD_DCtx *);
+static size_t (*_ZSTD_compressCCtx)(ZSTD_CCtx *, void *, size_t, const void *, size_t, int);
+static size_t (*_ZSTD_decompressDCtx)(ZSTD_DCtx *, void *, size_t, const void *, size_t);
+static unsigned (*_ZSTD_isError)(size_t);
+static int (*_ZSTD_maxCLevel)(void);
+static ZSTD_CCtx *g_zstd_cctx[NBD_THREADS_MAX];
+static ZSTD_DCtx *g_zstd_dctx[NBD_THREADS_MAX];
+static __thread ZSTD_CCtx *t_zstd_cctx;
+static __thread ZSTD_DCtx *t_zstd_dctx;
+
+static struct pte     *g_ptes;
+static uint64_t        g_npages;
+static struct slab    *g_slabs;
+static uint32_t        g_class_head[NCLASS];
+static uint32_t        g_nchunks, g_nfree_chunks, g_free_chunk = SLAB_NONE;
+static pthread_mutex_t g_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t g_plock[NPLOCK];
+static unsigned long   g_comp_enospc;
+static unsigned long   g_pages_compressed, g_pages_raw, g_pages_same;
+static uint64_t        g_vram_obj_bytes;   /* allocated object bytes, under g_alloc_lock */
+
+/* Dedup objects are immutable VRAM payloads. The index and all reference
+ * counts are protected by g_dedup_lock. Lock order is page -> dedup -> allocator;
+ * never acquire a page lock while holding either global lock. Readers need only
+ * their page lock: its reference keeps the immutable payload alive.
+ * Keep index allocations optional so disabled dedup adds no per-page metadata. */
+struct dedup_obj {
+    uint64_t hash, vram_off, refs;
+    struct dedup_obj *next, **prev;
+    uint16_t clen;
+    uint8_t kind, klass;
+};
+static struct dedup_obj **g_dedup_index, **g_dedup_ptes;
+static struct dedup_obj *g_dedup_objects, *g_dedup_free;
+static size_t g_dedup_capacity;
+static size_t g_dedup_buckets;
+static pthread_mutex_t g_dedup_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_dedup_unique, g_dedup_refs, g_dedup_saved_bytes, g_dedup_hits;
+static __thread char t_dedup_plain[COMP_PAGE];
+
+static uint64_t dedup_metadata_bytes(void)
 {
-    ssize_t r = recv(fd, h, sizeof(*h), MSG_DONTWAIT);
+    return g_dedup ? g_dedup_buckets * sizeof(*g_dedup_index) +
+                     g_npages * sizeof(*g_dedup_ptes) +
+                     g_dedup_capacity * sizeof(*g_dedup_objects) : 0;
+}
+
+static __thread char *t_cstage;
+static __thread int   t_cstage_cuda;
+static __thread char  t_page[COMP_PAGE] __attribute__((aligned(16)));
+
+static size_t compression_stage_size(void)
+{
+    return (size_t)(COMP_BATCH + (g_dedup ? 1 : 0)) * COMP_PAGE;
+}
+
+/* FNV-1a is only a lookup accelerator, never proof of equality. */
+static uint64_t page_hash(const char *plain)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int i = 0; i < COMP_PAGE; i++) {
+        hash ^= (unsigned char)plain[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int load_liblz4(void)
+{
+    const char *paths[] = {
+        "liblz4.so.1",
+        "/usr/lib/x86_64-linux-gnu/liblz4.so.1",
+        "/usr/lib64/liblz4.so.1",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        g_liblz4 = dlopen(paths[i], RTLD_NOW);
+        if (g_liblz4) {
+            printf("[nbd-vram] loaded %s\n", paths[i]);
+            break;
+        }
+    }
+    if (!g_liblz4) {
+        fprintf(stderr, "[nbd-vram] lz4 selected but cannot load liblz4.so.1 - install liblz4-1 (Debian) or lz4-libs (Fedora)\n");
+        return -1;
+    }
+    _LZ4_compress_default = (pfn_LZ4_compress_default)dlsym(g_liblz4, "LZ4_compress_default");
+    _LZ4_decompress_safe  = (pfn_LZ4_decompress_safe)dlsym(g_liblz4, "LZ4_decompress_safe");
+    if (!_LZ4_compress_default || !_LZ4_decompress_safe) {
+        fprintf(stderr, "[nbd-vram] liblz4 missing LZ4_compress_default/LZ4_decompress_safe\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int load_libzstd(void)
+{
+    g_libzstd = dlopen("libzstd.so.1", RTLD_NOW);
+    if (!g_libzstd) {
+        fprintf(stderr, "[nbd-vram] zstd selected but cannot load libzstd.so.1 - install libzstd1 (Debian) or libzstd (Fedora)\n");
+        return -1;
+    }
+    LOAD_SYM(g_libzstd, "ZSTD_createCCtx", _ZSTD_createCCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_createDCtx", _ZSTD_createDCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_freeCCtx", _ZSTD_freeCCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_freeDCtx", _ZSTD_freeDCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_compressCCtx", _ZSTD_compressCCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_decompressDCtx", _ZSTD_decompressDCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_isError", _ZSTD_isError);
+    LOAD_SYM(g_libzstd, "ZSTD_maxCLevel", _ZSTD_maxCLevel);
+    if (g_compress_level > _ZSTD_maxCLevel()) {
+        fprintf(stderr, "[nbd-vram] zstd level %d exceeds this library's maximum %d\n",
+                g_compress_level, _ZSTD_maxCLevel());
+        return -1;
+    }
+    /* Allocate and warm one context pair per worker before advertising readiness.
+     * All requests use fixed 4K pages, so the workspace can be reused under swap
+     * pressure without creating a new context for every page. */
+    char plain[COMP_PAGE] = {0}, packed[2 * COMP_PAGE];
+    for (int i = 0; i < g_nbd_threads; i++) {
+        g_zstd_cctx[i] = _ZSTD_createCCtx();
+        g_zstd_dctx[i] = _ZSTD_createDCtx();
+        if (!g_zstd_cctx[i] || !g_zstd_dctx[i]) {
+            fprintf(stderr, "[nbd-vram] zstd context allocation failed\n");
+            return -1;
+        }
+        size_t n = _ZSTD_compressCCtx(g_zstd_cctx[i], packed, sizeof(packed),
+                                    plain, sizeof(plain), g_compress_level);
+        if (_ZSTD_isError(n) ||
+            _ZSTD_decompressDCtx(g_zstd_dctx[i], plain, sizeof(plain), packed, n) != COMP_PAGE) {
+            fprintf(stderr, "[nbd-vram] zstd context initialization failed\n");
+            return -1;
+        }
+    }
+    printf("[nbd-vram] loaded libzstd.so.1 (level %d)\n", g_compress_level);
+    return 0;
+}
+
+/* A zero result means store the original page instead (including codec errors).
+ * The codec is fixed for the lifetime of the store, so PTEs need no codec tag. */
+static int compress_page(const char *src, char *dst)
+{
+    if (g_compress == COMP_OFF) return 0;
+    if (g_compress == COMP_ZSTD) {
+        size_t n = _ZSTD_compressCCtx(t_zstd_cctx, dst, COMP_PAGE - 1,
+                                    src, COMP_PAGE, g_compress_level);
+        return _ZSTD_isError(n) ? 0 : (int)n;
+    }
+    return _LZ4_compress_default(src, dst, COMP_PAGE, COMP_PAGE - 1);
+}
+
+static int decompress_page(const char *src, char *dst, uint16_t len)
+{
+    if (g_compress == COMP_ZSTD)
+        return _ZSTD_decompressDCtx(t_zstd_dctx, dst, COMP_PAGE, src, len) == COMP_PAGE;
+    return _LZ4_decompress_safe(src, dst, len, COMP_PAGE) == COMP_PAGE;
+}
+
+static inline void lock_page(uint64_t pg)   { pthread_rwlock_wrlock(&g_plock[pg % NPLOCK]); }
+static inline void unlock_page(uint64_t pg) { pthread_rwlock_unlock(&g_plock[pg % NPLOCK]); }
+
+/* A batch contains distinct lock stripes. Acquire them in ascending order,
+ * including when page numbers wrap around NPLOCK or requests arrive out of
+ * order. No worker waits for a lower stripe while holding a higher one. */
+static void lock_pages(const uint64_t *pages, int n, int writing)
+{
+    unsigned stripes[COMP_BATCH];
+    for (int i = 0; i < n; i++) {
+        unsigned stripe = (unsigned)(pages[i] % NPLOCK);
+        int j = i;
+        while (j && stripes[j - 1] > stripe) {
+            stripes[j] = stripes[j - 1];
+            j--;
+        }
+        stripes[j] = stripe;
+    }
+    for (int i = 0; i < n; i++) {
+        if (writing) pthread_rwlock_wrlock(&g_plock[stripes[i]]);
+        else pthread_rwlock_rdlock(&g_plock[stripes[i]]);
+    }
+}
+
+static inline int bm_test(const uint8_t *bm, unsigned i) { return (bm[i >> 3] >> (i & 7)) & 1; }
+static inline void bm_set(uint8_t *bm, unsigned i) { bm[i >> 3] |= (uint8_t)(1u << (i & 7)); }
+static inline void bm_clr(uint8_t *bm, unsigned i) { bm[i >> 3] &= (uint8_t)~(1u << (i & 7)); }
+
+static int class_for(uint32_t n)
+{
+    for (int i = 0; i < NCLASS; i++)
+        if (k_class_sz[i] >= n) return i;
+    return NCLASS - 1;
+}
+
+static int is_same_filled(const char *p, uint8_t *fill)
+{
+    unsigned char v = (unsigned char)p[0];
+    if ((uintptr_t)p & 7) {
+        for (int i = 1; i < COMP_PAGE; i++)
+            if ((unsigned char)p[i] != v) return 0;
+        *fill = (uint8_t)v;
+        return 1;
+    }
+    uint64_t splat = 0x0101010101010101ULL * v;
+    const uint64_t *q = (const uint64_t *)(const void *)p;
+    for (int i = 0; i < COMP_PAGE / 8; i++)
+        if (q[i] != splat) return 0;
+    *fill = (uint8_t)v;
+    return 1;
+}
+
+/* Only slabs with free slots are on a class list. All records and bitmaps are
+ * allocated at startup; these helpers run under g_alloc_lock without malloc. */
+static void class_link(struct slab *s)
+{
+    s->prev = SLAB_NONE;
+    s->next = g_class_head[s->klass];
+    if (s->next != SLAB_NONE) g_slabs[s->next].prev = s->chunk;
+    g_class_head[s->klass] = s->chunk;
+}
+
+static void class_unlink(struct slab *s)
+{
+    if (s->prev != SLAB_NONE) g_slabs[s->prev].next = s->next;
+    else g_class_head[s->klass] = s->next;
+    if (s->next != SLAB_NONE) g_slabs[s->next].prev = s->prev;
+    s->next = s->prev = SLAB_NONE;
+}
+
+static struct slab *slab_new(uint8_t klass)
+{
+    if (g_free_chunk == SLAB_NONE) return NULL;
+    struct slab *s = &g_slabs[g_free_chunk];
+    g_free_chunk = s->next;
+    g_nfree_chunks--;
+    s->klass = klass;
+    s->nobj  = (uint16_t)(SLAB_SZ / k_class_sz[klass]);
+    s->nfree = s->nobj;
+    s->hint = 0;
+    memset(s->bm, 0, sizeof(s->bm));
+    class_link(s);
+    return s;
+}
+
+static void slab_destroy(struct slab *s)
+{
+    class_unlink(s);
+    s->nobj = s->nfree = 0;
+    s->next = g_free_chunk;
+    g_free_chunk = s->chunk;
+    g_nfree_chunks++;
+}
+
+static int bm_alloc_obj(struct slab *s)
+{
+    unsigned n = s->nobj, i = s->hint;
+    for (unsigned k = 0; k < n; k++) {
+        if (!bm_test(s->bm, i)) {
+            bm_set(s->bm, i);
+            s->hint = (i + 1 < n) ? (uint16_t)(i + 1) : 0;
+            return (int)i;
+        }
+        if (++i == n) i = 0;
+    }
+    return -1;
+}
+
+/* Caller holds g_alloc_lock. Return the actual class in *klass: a larger slot
+ * may be borrowed when the requested class and the unused-slab pool are empty.
+ * PTEs and dedup objects must retain this class for freeing and accounting. */
+static uint64_t pool_alloc(uint8_t *klass)
+{
+    uint32_t chunk = g_class_head[*klass];
+    struct slab *s = chunk != SLAB_NONE ? &g_slabs[chunk] : slab_new(*klass);
+    if (!s) {
+        for (int k = *klass + 1; k < NCLASS; k++) {
+            if (g_class_head[k] == SLAB_NONE) continue;
+            s = &g_slabs[g_class_head[k]];
+            break;
+        }
+    }
+    if (!s) return UINT64_MAX;
+    int obj = bm_alloc_obj(s);
+    if (obj < 0) return UINT64_MAX;
+    if (--s->nfree == 0) class_unlink(s);
+    *klass = s->klass;
+    g_vram_obj_bytes += k_class_sz[*klass];
+    return (uint64_t)s->chunk * SLAB_SZ + (uint64_t)obj * k_class_sz[*klass];
+}
+
+static void pool_free(uint64_t off, uint8_t klass)
+{
+    uint32_t chunk = (uint32_t)(off / SLAB_SZ);
+    struct slab *s = &g_slabs[chunk];
+    unsigned obj = (unsigned)((off % SLAB_SZ) / k_class_sz[klass]);
+    if (g_vram_obj_bytes >= k_class_sz[klass])
+        g_vram_obj_bytes -= k_class_sz[klass];
+    bm_clr(s->bm, obj);
+    if (!s->nfree) class_link(s);
+    s->nfree++;
+    if (s->nfree == s->nobj)
+        slab_destroy(s);
+}
+
+static uint32_t load_plain(uint64_t pg, char *dst, CUstream stream)
+{
+    struct pte e = g_ptes[pg];
+    switch (e.kind) {
+    case PTE_NONE:
+        memset(dst, 0, COMP_PAGE);
+        return 0;
+    case PTE_SAME:
+        memset(dst, e.fill, COMP_PAGE);
+        return 0;
+    case PTE_RAW:
+        if (_cuMemcpyDtoHAsync(dst, g_vram_ptr + e.vram_off, COMP_PAGE, stream) != CUDA_SUCCESS)
+            return EIO;
+        if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) return EIO;
+        return 0;
+    case PTE_COMPRESSED:
+        if (_cuMemcpyDtoHAsync(t_cstage, g_vram_ptr + e.vram_off, e.clen, stream) != CUDA_SUCCESS)
+            return EIO;
+        if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) return EIO;
+        if (!decompress_page(t_cstage, dst, e.clen))
+            return EIO;
+        return 0;
+    default:
+        return EIO;
+    }
+}
+
+static void prepare_plain(uint64_t pg, const char *plain, int slot, struct cpend *op)
+{
+    uint8_t fill;
+    op->plain    = plain;
+    op->hash     = 0;
+    op->pg       = pg;
+    op->slot     = (uint8_t)slot;
+    op->new_off  = 0;
+    op->fill     = 0;
+    op->clen     = 0;
+    op->klass    = 0;
+    if (is_same_filled(plain, &fill)) {
+        op->kind = PTE_SAME;
+        op->fill = fill;
+        return;
+    }
+    if (g_dedup) op->hash = page_hash(plain);
+    char *slotp = t_cstage + (size_t)slot * COMP_PAGE;
+    int csz = compress_page(plain, slotp);
+    if (csz <= 0) {
+        memcpy(slotp, plain, COMP_PAGE);
+        op->kind  = PTE_RAW;
+        op->clen  = COMP_PAGE;
+        op->klass = (uint8_t)class_for(COMP_PAGE);
+    } else {
+        op->kind  = PTE_COMPRESSED;
+        op->clen  = (uint16_t)csz;
+        op->klass = (uint8_t)class_for((uint32_t)csz);
+    }
+}
+
+static void pte_kind_add(uint8_t kind, int delta)
+{
+    unsigned long *p = NULL;
+    switch (kind) {
+    case PTE_COMPRESSED:  p = &g_pages_compressed;  break;
+    case PTE_RAW:  p = &g_pages_raw;  break;
+    case PTE_SAME: p = &g_pages_same; break;
+    default: return;
+    }
+    if (delta > 0)
+        __sync_fetch_and_add(p, (unsigned long)delta);
+    else
+        __sync_fetch_and_sub(p, (unsigned long)(-delta));
+}
+
+/* All dedup helpers below require g_dedup_lock. A reference may belong to a
+ * published PTE or a pending batch. Pending references are rolled back together
+ * on failure; old PTEs and their references remain intact until every new payload
+ * has been copied and synchronized successfully. */
+static void dedup_object_release(struct dedup_obj *obj)
+{
+    obj->refs = 0;
+    obj->prev = NULL;
+    obj->next = g_dedup_free;
+    g_dedup_free = obj;
+}
+
+static void dedup_put(struct dedup_obj *obj)
+{
+    if (!obj) return;
+    g_dedup_refs--;
+    if (--obj->refs) {
+        g_dedup_saved_bytes -= k_class_sz[obj->klass];
+        return;
+    }
+    if (obj->prev) { /* Pending objects are not indexed until DMA succeeds. */
+        *obj->prev = obj->next;
+        if (obj->next) obj->next->prev = obj->prev;
+    }
+    g_dedup_unique--;
+    pthread_mutex_lock(&g_alloc_lock);
+    pool_free(obj->vram_off, obj->klass);
+    pthread_mutex_unlock(&g_alloc_lock);
+    dedup_object_release(obj);
+}
+
+static uint32_t dedup_get(struct cpend *ops, struct dedup_obj **objects, int idx,
+                          unsigned *hits, int *upload, CUstream stream)
+{
+    struct cpend *op = &ops[idx];
+    struct dedup_obj **out = &objects[idx];
+    /* Earlier pages in this batch still have their original bytes in host
+     * memory. Match there, avoiding a download of an as-yet-unwritten slot. */
+    for (int i = 0; i < idx; i++) {
+        struct dedup_obj *obj = objects[i];
+        if (!obj || obj->hash != op->hash || memcmp(ops[i].plain, op->plain, COMP_PAGE))
+            continue;
+        obj->refs++;
+        g_dedup_refs++;
+        g_dedup_saved_bytes += k_class_sz[obj->klass];
+        (*hits)++;
+        *out = obj;
+        return 0;
+    }
+    size_t bucket = op->hash & (g_dedup_buckets - 1);
+    char *compare = t_cstage + (size_t)COMP_BATCH * COMP_PAGE;
+    for (struct dedup_obj *obj = g_dedup_index[bucket]; obj; obj = obj->next) {
+        if (obj->hash != op->hash) continue;
+        CUresult r = _cuMemcpyDtoHAsync(compare, g_vram_ptr + obj->vram_off,
+                                        obj->clen, stream);
+        CUresult sync = _cuStreamSynchronize(stream);
+        if (r != CUDA_SUCCESS || sync != CUDA_SUCCESS) return EIO;
+        const char *plain = compare;
+        if (obj->kind == PTE_COMPRESSED) {
+            if (!decompress_page(compare, t_dedup_plain, obj->clen)) return EIO;
+            plain = t_dedup_plain;
+        }
+        if (memcmp(plain, op->plain, COMP_PAGE) != 0) continue;
+        obj->refs++;
+        g_dedup_refs++;
+        g_dedup_saved_bytes += k_class_sz[obj->klass];
+        (*hits)++;
+        *out = obj;
+        return 0;
+    }
+
+    struct dedup_obj *obj = g_dedup_free;
+    if (!obj) return ENOSPC;
+    pthread_mutex_lock(&g_alloc_lock);
+    uint64_t off = pool_alloc(&op->klass);
+    pthread_mutex_unlock(&g_alloc_lock);
+    if (off == UINT64_MAX) return ENOSPC;
+    g_dedup_free = obj->next;
+
+    obj->hash = op->hash;
+    obj->vram_off = off;
+    obj->clen = op->clen;
+    obj->kind = op->kind;
+    obj->klass = op->klass;
+    obj->refs = 1;
+    obj->next = NULL;
+    obj->prev = NULL;
+    g_dedup_unique++;
+    g_dedup_refs++;
+    *out = obj;
+    *upload = 1;
+    return 0;
+}
+
+/* Page locks are already held. Reserve references first, upload all new objects
+ * with one sync, then index them and publish. The dedup lock keeps other writers
+ * from observing reservations and protects exact comparisons with live objects. */
+static uint32_t dedup_commit(struct cpend *ops, int n, CUstream stream)
+{
+    struct dedup_obj *objects[COMP_BATCH] = {0};
+    int upload[COMP_BATCH] = {0};
+    uint32_t error = 0;
+    unsigned hits = 0;
+    pthread_mutex_lock(&g_dedup_lock);
+    for (int i = 0; i < n; i++) {
+        if (ops[i].kind == PTE_SAME) continue;
+        error = dedup_get(ops, objects, i, &hits, &upload[i], stream);
+        if (error) break;
+    }
+    int queued = 0;
+    if (!error) {
+        for (int i = 0; i < n; i++) {
+            if (!upload[i]) continue;
+            if (_cuMemcpyHtoDAsync(g_vram_ptr + objects[i]->vram_off,
+                                  t_cstage + (size_t)ops[i].slot * COMP_PAGE,
+                                  ops[i].clen, stream) != CUDA_SUCCESS) {
+                error = EIO;
+                break;
+            }
+            queued++;
+        }
+    }
+    /* Drain even after an enqueue failure before recycling any reserved slot. */
+    if (queued && _cuStreamSynchronize(stream) != CUDA_SUCCESS) error = EIO;
+    if (error) {
+        for (int i = 0; i < n; i++) dedup_put(objects[i]);
+        if (error == ENOSPC) __sync_fetch_and_add(&g_comp_enospc, 1);
+    } else {
+        for (int i = 0; i < n; i++) {
+            if (!upload[i]) continue;
+            struct dedup_obj *obj = objects[i];
+            size_t bucket = obj->hash & (g_dedup_buckets - 1);
+            obj->next = g_dedup_index[bucket];
+            obj->prev = &g_dedup_index[bucket];
+            if (obj->next) obj->next->prev = &obj->next;
+            g_dedup_index[bucket] = obj;
+        }
+        for (int i = 0; i < n; i++) {
+            struct pte *e = &g_ptes[ops[i].pg];
+            struct dedup_obj *old = g_dedup_ptes[ops[i].pg];
+            struct dedup_obj *obj = objects[i];
+            *e = (struct pte){ .kind = PTE_SAME, .fill = ops[i].fill };
+            if (obj) {
+                e->kind = obj->kind;
+                e->clen = obj->clen;
+                e->klass = obj->klass;
+                e->vram_off = obj->vram_off;
+            }
+            g_dedup_ptes[ops[i].pg] = obj;
+            pte_kind_add(ops[i].old_kind, -1);
+            pte_kind_add(e->kind, 1);
+            dedup_put(old);
+        }
+        g_dedup_hits += hits;
+    }
+    pthread_mutex_unlock(&g_dedup_lock);
+    for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
+    return error;
+}
+
+static void lock_pending_writes(struct cpend *ops, int n)
+{
+    if (n <= 0) return;
+    uint64_t pages[COMP_BATCH];
+    for (int i = 0; i < n; i++) pages[i] = ops[i].pg;
+    lock_pages(pages, n, 1);
+}
+
+/* Snapshot only while holding the page locks. With unlocked uploads, capture
+ * after DMA: another connection may have overwritten or trimmed the page. */
+static void snapshot_old_pages(struct cpend *ops, int n)
+{
+    for (int i = 0; i < n; i++) {
+        struct pte *e = &g_ptes[ops[i].pg];
+        ops[i].old_kind = e->kind;
+        ops[i].old_off = e->vram_off;
+        ops[i].old_klass = e->klass;
+    }
+}
+
+/* Full-page, non-dedup writes enter without page locks: reserved slots are
+ * private until DMA completes and the mappings are published. Partial writes
+ * keep their locks throughout read/modify/write; dedup keeps its existing lock
+ * order and reference lifetime. Releases any held page locks on every path. */
+static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream,
+                                     int pages_locked)
+{
+    if (n <= 0) return 0;
+    if (g_dedup) {
+        snapshot_old_pages(ops, n);
+        return dedup_commit(ops, n, stream);
+    }
+
+    pthread_mutex_lock(&g_alloc_lock);
+    int failed = -1;
+    uint32_t error = 0;
+    int queued = 0;
+    for (int i = 0; i < n; i++) {
+        if (ops[i].kind != PTE_COMPRESSED && ops[i].kind != PTE_RAW)
+            continue;
+        uint64_t off = pool_alloc(&ops[i].klass);
+        if (off == UINT64_MAX) { failed = i; break; }
+        ops[i].new_off = off;
+    }
+    if (failed >= 0) {
+        for (int i = 0; i < failed; i++) {
+            if (ops[i].kind == PTE_COMPRESSED || ops[i].kind == PTE_RAW)
+                pool_free(ops[i].new_off, ops[i].klass);
+        }
+        pthread_mutex_unlock(&g_alloc_lock);
+        if (pages_locked)
+            for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
+        if (__sync_fetch_and_add(&g_comp_enospc, 1) == 0)
+            fprintf(stderr, "[nbd-vram] compressed VRAM pool full (ENOSPC) - kernel will use other swap if available\n");
+        return ENOSPC;
+    }
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    for (int i = 0; i < n; i++) {
+        if (ops[i].kind != PTE_COMPRESSED && ops[i].kind != PTE_RAW)
+            continue;
+        size_t nbytes = (ops[i].kind == PTE_RAW) ? COMP_PAGE : ops[i].clen;
+        CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + ops[i].new_off,
+                                        t_cstage + (size_t)ops[i].slot * COMP_PAGE,
+                                        nbytes, stream);
+        if (r != CUDA_SUCCESS) {
+            error = EIO;
+            break;
+        }
+        queued++;
+    }
+    if (queued && _cuStreamSynchronize(stream) != CUDA_SUCCESS) error = EIO;
+    if (error) {
+        pthread_mutex_lock(&g_alloc_lock);
+        for (int i = 0; i < n; i++) {
+            if (ops[i].kind == PTE_COMPRESSED || ops[i].kind == PTE_RAW)
+                pool_free(ops[i].new_off, ops[i].klass);
+        }
+        pthread_mutex_unlock(&g_alloc_lock);
+        if (pages_locked)
+            for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
+        return error;
+    }
+
+    /* No allocator lock is held while acquiring page locks. Read the current
+     * mappings now, so an intervening write/TRIM cannot make old_off stale. */
+    if (!pages_locked) lock_pending_writes(ops, n);
+    snapshot_old_pages(ops, n);
+    pthread_mutex_lock(&g_alloc_lock);
+    for (int i = 0; i < n; i++) {
+        if (ops[i].old_kind == PTE_COMPRESSED || ops[i].old_kind == PTE_RAW)
+            pool_free(ops[i].old_off, ops[i].old_klass);
+    }
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    for (int i = 0; i < n; i++) {
+        struct pte *e = &g_ptes[ops[i].pg];
+        e->kind     = ops[i].kind;
+        e->fill     = ops[i].fill;
+        e->clen     = ops[i].clen;
+        e->klass    = ops[i].klass;
+        e->vram_off = ops[i].new_off;
+        if (ops[i].kind == PTE_SAME) {
+            e->vram_off = 0;
+            e->clen = 0;
+            e->klass = 0;
+        }
+        pte_kind_add(ops[i].old_kind, -1);
+        pte_kind_add(ops[i].kind, 1);
+        unlock_page(ops[i].pg);
+    }
+    return 0;
+}
+
+static uint32_t write_pending(struct cpend *ops, int n, CUstream stream)
+{
+    if (g_dedup) lock_pending_writes(ops, n);
+    return cpend_alloc_and_commit(ops, n, stream, g_dedup);
+}
+
+static uint32_t store_partial(uint64_t pg, const char *frag, uint32_t lo, uint32_t hi, CUstream stream)
+{
+    lock_page(pg);
+    uint32_t err = load_plain(pg, t_page, stream);
+    if (err) { unlock_page(pg); return err; }
+    memcpy(t_page + lo, frag, hi - lo);
+    struct cpend op;
+    prepare_plain(pg, t_page, 0, &op);
+    return cpend_alloc_and_commit(&op, 1, stream, 1);
+}
+
+static uint32_t comp_write(uint64_t offset, const char *buf, uint32_t len, CUstream stream)
+{
+    if (!len) return 0;
+    if (!t_cstage) return EIO;
+    uint64_t pg0 = offset / COMP_PAGE;
+    uint64_t pg1 = (offset + len - 1) / COMP_PAGE;
+    struct cpend ops[COMP_BATCH];
+    int n = 0;
+
+    for (uint64_t pg = pg0; pg <= pg1; pg++) {
+        uint64_t pg_off = pg * COMP_PAGE;
+        uint32_t lo = (offset > pg_off) ? (uint32_t)(offset - pg_off) : 0;
+        uint32_t hi = (offset + len < pg_off + COMP_PAGE)
+                        ? (uint32_t)(offset + len - pg_off) : COMP_PAGE;
+        if (lo != 0 || hi != COMP_PAGE) {
+            if (n) {
+                uint32_t err = write_pending(ops, n, stream);
+                n = 0;
+                if (err) return err;
+            }
+            uint32_t err = store_partial(pg, buf + (pg_off + lo - offset), lo, hi, stream);
+            if (err) return err;
+            continue;
+        }
+        prepare_plain(pg, buf + (pg_off - offset), n, &ops[n]);
+        n++;
+        if (n == COMP_BATCH) {
+            uint32_t err = write_pending(ops, n, stream);
+            n = 0;
+            if (err) return err;
+        }
+    }
+    if (n) return write_pending(ops, n, stream);
+    return 0;
+}
+
+static uint32_t rpend_commit(struct rpend *ops, int n, CUstream stream)
+{
+    if (n <= 0) return 0;
+    uint64_t pages[COMP_BATCH];
+    for (int i = 0; i < n; i++) pages[i] = ops[i].pg;
+    lock_pages(pages, n, 0);
+    uint32_t error = 0;
+    int queued = 0;
+    for (int i = 0; i < n; i++) {
+        struct pte e = g_ptes[ops[i].pg];
+        ops[i].kind = e.kind;
+        ops[i].clen = e.clen;
+        ops[i].vram_off = e.vram_off;
+        if (e.kind == PTE_NONE || e.kind == PTE_SAME) {
+            memset(ops[i].dst, e.kind == PTE_NONE ? 0 : e.fill, COMP_PAGE);
+            continue;
+        }
+        size_t nbytes = (ops[i].kind == PTE_RAW) ? COMP_PAGE : ops[i].clen;
+        CUresult r = _cuMemcpyDtoHAsync(t_cstage + (size_t)ops[i].slot * COMP_PAGE,
+                                        g_vram_ptr + ops[i].vram_off, nbytes, stream);
+        if (r != CUDA_SUCCESS) {
+            error = EIO;
+            break;
+        }
+        queued++;
+    }
+    if (queued && _cuStreamSynchronize(stream) != CUDA_SUCCESS) error = EIO;
+    /* DMA has finished using the VRAM objects. Decode only from this worker's
+     * private staging and metadata snapshots, allowing overwrite/TRIM to proceed. */
+    for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
+    for (int i = 0; i < n && !error; i++) {
+        char *dst = ops[i].dst;
+        char *src = t_cstage + (size_t)ops[i].slot * COMP_PAGE;
+        if (ops[i].kind == PTE_RAW) {
+            memcpy(dst, src, COMP_PAGE);
+        } else if (ops[i].kind == PTE_COMPRESSED && !decompress_page(src, dst, ops[i].clen)) {
+            error = EIO;
+        }
+    }
+    return error;
+}
+
+static uint32_t comp_read(uint64_t offset, char *buf, uint32_t len, CUstream stream)
+{
+    if (!len) return 0;
+    if (!t_cstage) return EIO;
+    uint64_t pg0 = offset / COMP_PAGE;
+    uint64_t pg1 = (offset + len - 1) / COMP_PAGE;
+    struct rpend ops[COMP_BATCH];
+    int n = 0;
+
+    for (uint64_t pg = pg0; pg <= pg1; pg++) {
+        uint64_t pg_off = pg * COMP_PAGE;
+        uint32_t lo = (offset > pg_off) ? (uint32_t)(offset - pg_off) : 0;
+        uint32_t hi = (offset + len < pg_off + COMP_PAGE)
+                        ? (uint32_t)(offset + len - pg_off) : COMP_PAGE;
+        if (lo != 0 || hi != COMP_PAGE) {
+            if (n) {
+                uint32_t err = rpend_commit(ops, n, stream);
+                n = 0;
+                if (err) return err;
+            }
+            struct rpend op = { .pg = pg, .dst = t_page, .slot = 0 };
+            uint32_t err = rpend_commit(&op, 1, stream);
+            if (err) return err;
+            memcpy(buf + (pg_off + lo - offset), t_page + lo, hi - lo);
+            continue;
+        }
+        ops[n].pg       = pg;
+        ops[n].dst      = buf + (pg_off - offset);
+        ops[n].slot     = (uint8_t)n;
+        n++;
+        if (n == COMP_BATCH) {
+            uint32_t err = rpend_commit(ops, n, stream);
+            n = 0;
+            if (err) return err;
+        }
+    }
+    if (n) return rpend_commit(ops, n, stream);
+    return 0;
+}
+
+static uint32_t comp_trim(uint64_t offset, uint32_t len, CUstream stream)
+{
+    if (!len) return 0;
+    uint64_t pg0 = offset / COMP_PAGE;
+    uint64_t pg1 = (offset + len - 1) / COMP_PAGE;
+    for (uint64_t pg = pg0; pg <= pg1; pg++) {
+        uint64_t pg_off = pg * COMP_PAGE;
+        uint32_t lo = (offset > pg_off) ? (uint32_t)(offset - pg_off) : 0;
+        uint32_t hi = (offset + len < pg_off + COMP_PAGE)
+                        ? (uint32_t)(offset + len - pg_off) : COMP_PAGE;
+        if (lo != 0 || hi != COMP_PAGE) {
+            char z[COMP_PAGE];
+            memset(z, 0, hi - lo);
+            uint32_t err = store_partial(pg, z, lo, hi, stream);
+            if (err) return err;
+            continue;
+        }
+        lock_page(pg);
+        if (g_dedup) pthread_mutex_lock(&g_dedup_lock);
+        struct pte old = g_ptes[pg];
+        memset(&g_ptes[pg], 0, sizeof(g_ptes[pg]));
+        pte_kind_add(old.kind, -1);
+        if (g_dedup) {
+            dedup_put(g_dedup_ptes[pg]);
+            g_dedup_ptes[pg] = NULL;
+            pthread_mutex_unlock(&g_dedup_lock);
+        } else if (old.kind == PTE_COMPRESSED || old.kind == PTE_RAW) {
+            pthread_mutex_lock(&g_alloc_lock);
+            pool_free(old.vram_off, old.klass);
+            pthread_mutex_unlock(&g_alloc_lock);
+        }
+        unlock_page(pg);
+    }
+    return 0;
+}
+
+static void compress_status_write(void)
+{
+    uint32_t slabs_used;
+    uint64_t obj_bytes, dedup_pages, dedup_unique, dedup_saved, dedup_hits, index_bytes;
+    pthread_mutex_lock(&g_dedup_lock);
+    pthread_mutex_lock(&g_alloc_lock);
+    slabs_used = g_nchunks - g_nfree_chunks;
+    obj_bytes  = g_vram_obj_bytes;
+    pthread_mutex_unlock(&g_alloc_lock);
+    dedup_pages = g_dedup_refs - g_dedup_unique;
+    dedup_unique = g_dedup_unique;
+    dedup_saved = g_dedup_saved_bytes;
+    dedup_hits = g_dedup_hits;
+    index_bytes = dedup_metadata_bytes();
+    unsigned long compressed = __atomic_load_n(&g_pages_compressed, __ATOMIC_RELAXED);
+    unsigned long raw = __atomic_load_n(&g_pages_raw, __ATOMIC_RELAXED);
+    unsigned long same = __atomic_load_n(&g_pages_same, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_dedup_lock);
+    char buf[1536];
+    int cfg_whole = g_compress_ratio_tenths / 10;
+    int cfg_frac  = g_compress_ratio_tenths % 10;
+    int n = snprintf(buf, sizeof(buf),
+        "compress=%d\n"
+        "dedup=%d\n"
+        "dedup_pages=%llu\n"
+        "dedup_unique_pages=%llu\n"
+        "dedup_saved_bytes=%llu\n"
+        "dedup_hits=%llu\n"
+        "dedup_index_bytes=%llu\n"
+        "algorithm=%s\n"
+        "compression_level=%d\n"
+        "configured_ratio=%d.%d\n"
+        "configured_ratio_tenths=%d\n"
+        "vram_bytes=%llu\n"
+        "export_bytes=%llu\n"
+        "vram_slab_bytes=%llu\n"
+        "vram_obj_bytes=%llu\n"
+        "pages_lz4=%lu\n"
+        "pages_zstd=%lu\n"
+        "pages_raw=%lu\n"
+        "pages_same=%lu\n"
+        "enospc=%lu\n",
+        g_compress != COMP_OFF, g_dedup,
+        (unsigned long long)dedup_pages, (unsigned long long)dedup_unique,
+        (unsigned long long)dedup_saved, (unsigned long long)dedup_hits,
+        (unsigned long long)index_bytes,
+        compression_name(), g_compress == COMP_ZSTD ? g_compress_level : 0,
+        cfg_whole, cfg_frac, g_compress_ratio_tenths,
+        (unsigned long long)g_vram_size,
+        (unsigned long long)g_export_size,
+        (unsigned long long)slabs_used * SLAB_SZ,
+        (unsigned long long)obj_bytes,
+        g_compress == COMP_LZ4 ? compressed : 0,
+        g_compress == COMP_ZSTD ? compressed : 0, raw, same,
+        __atomic_load_n(&g_comp_enospc, __ATOMIC_RELAXED));
+    if (n <= 0 || n >= (int)sizeof(buf)) return;
+
+    int fd = open(STATUS_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    ssize_t w = write(fd, buf, (size_t)n);
+    close(fd);
+    if (w == (ssize_t)n)
+        rename(STATUS_TMP, STATUS_PATH);
+    else
+        unlink(STATUS_TMP);
+}
+
+static void *status_worker(void *arg)
+{
+    (void)arg;
+    prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+    while (g_running) {
+        compress_status_write();
+        struct timespec ts = { 1, 0 };
+        nanosleep(&ts, NULL);
+    }
+    unlink(STATUS_PATH);
+    unlink(STATUS_TMP);
+    return NULL;
+}
+
+/* Fault in writable backing now, including calloc's lazily mapped zero pages.
+ * Volatile stores keep this pass from being optimized back into calloc. The
+ * daemon's mlockall keeps this metadata resident while serving swap requests. */
+static void *metadata_calloc(size_t count, size_t size)
+{
+    if (size && count > SIZE_MAX / size) { errno = ENOMEM; return NULL; }
+    size_t bytes = count * size;
+    void *ptr = calloc(count, size);
+    if (!ptr) return NULL;
+    long page_size = sysconf(_SC_PAGESIZE);
+    size_t step = page_size > 0 ? (size_t)page_size : 4096;
+    volatile unsigned char *p = ptr;
+    for (size_t i = 0; i < bytes; i += step) p[i] = 0;
+    if (bytes) p[bytes - 1] = 0;
+    return ptr;
+}
+
+static int compress_init(void)
+{
+    if (g_compress && (g_compress == COMP_ZSTD ? load_libzstd() : load_liblz4()) != 0) return -1;
+    if (g_vram_size < SLAB_SZ || (g_vram_size % SLAB_SZ) != 0) {
+        fprintf(stderr, "[nbd-vram] VRAM size not aligned to %u KiB slabs\n", SLAB_SZ / 1024);
+        return -1;
+    }
+    /* Fractional ratios can leave a partial page. Do not advertise bytes beyond
+     * the last PTE; even a sector-aligned access there would overrun the table. */
+    g_export_size = (g_export_size / COMP_PAGE) * COMP_PAGE;
+    g_npages = g_export_size / COMP_PAGE;
+    if (g_npages > SIZE_MAX / sizeof(*g_ptes) || g_vram_size / SLAB_SZ >= SLAB_NONE) {
+        fprintf(stderr, "[nbd-vram] packed store metadata exceeds addressable size\n");
+        return -1;
+    }
+    g_ptes = metadata_calloc(g_npages, sizeof(*g_ptes));
+    if (!g_ptes) { perror("calloc ptes"); return -1; }
+    if (g_dedup) {
+        g_dedup_buckets = 16;
+        while (g_dedup_buckets < g_npages / 4 && g_dedup_buckets < (1u << 20))
+            g_dedup_buckets *= 2;
+        /* Each logical page can hold one unique object, plus one pending batch
+         * while replacing old references. Dedup commits are serialized, so no
+         * per-worker multiplier is needed. Physical slot count is another cap. */
+        uint64_t capacity = g_vram_size / (g_compress ? k_class_sz[0] : COMP_PAGE);
+        if (capacity > g_npages + COMP_BATCH) capacity = g_npages + COMP_BATCH;
+        if (capacity > SIZE_MAX / sizeof(*g_dedup_objects)) {
+            fprintf(stderr, "[nbd-vram] dedup metadata exceeds addressable size\n");
+            return -1;
+        }
+        g_dedup_capacity = (size_t)capacity;
+        g_dedup_index = metadata_calloc(g_dedup_buckets, sizeof(*g_dedup_index));
+        g_dedup_ptes = metadata_calloc(g_npages, sizeof(*g_dedup_ptes));
+        g_dedup_objects = metadata_calloc(g_dedup_capacity, sizeof(*g_dedup_objects));
+        if (!g_dedup_index || !g_dedup_ptes || !g_dedup_objects) {
+            perror("calloc dedup"); return -1;
+        }
+        g_dedup_free = NULL;
+        for (size_t i = g_dedup_capacity; i-- > 0; )
+            dedup_object_release(&g_dedup_objects[i]);
+    }
+    g_nchunks = (uint32_t)(g_vram_size / SLAB_SZ);
+    g_slabs = metadata_calloc(g_nchunks, sizeof(*g_slabs));
+    if (!g_slabs) { perror("calloc slabs"); return -1; }
+    for (int k = 0; k < NCLASS; k++) g_class_head[k] = SLAB_NONE;
+    g_free_chunk = SLAB_NONE;
+    for (uint32_t i = g_nchunks; i-- > 0; ) {
+        g_slabs[i].chunk = i;
+        g_slabs[i].next = g_free_chunk;
+        g_free_chunk = i;
+    }
+    g_nfree_chunks = g_nchunks;
+    for (int i = 0; i < NPLOCK; i++)
+        pthread_rwlock_init(&g_plock[i], NULL);
+    printf("[nbd-vram] reserved metadata: page table %.1f MiB, slabs %.1f MiB, dedup %.1f MiB\n",
+           (double)g_npages * sizeof(*g_ptes) / (1024.0 * 1024.0),
+           (double)g_nchunks * sizeof(*g_slabs) / (1024.0 * 1024.0),
+           (double)dedup_metadata_bytes() / (1024.0 * 1024.0));
+    return 0;
+}
+
+static void compress_shutdown(void)
+{
+    unlink(STATUS_PATH);
+    unlink(STATUS_TMP);
+    if (g_ptes)
+        printf("[nbd-vram] compress: %u/%u slabs used, %lu ENOSPC writes\n",
+               g_nchunks - g_nfree_chunks, g_nchunks, g_comp_enospc);
+    /* Workers are stopped. Pools can be released even after partial init or
+     * with live objects; individual records never own separate allocations. */
+    free(g_dedup_index); g_dedup_index = NULL;
+    free(g_dedup_ptes); g_dedup_ptes = NULL;
+    free(g_dedup_objects); g_dedup_objects = g_dedup_free = NULL;
+    g_dedup_capacity = 0;
+    free(g_ptes); g_ptes = NULL;
+    free(g_slabs); g_slabs = NULL;
+    if (g_liblz4) { dlclose(g_liblz4); g_liblz4 = NULL; }
+    for (int i = 0; i < g_nbd_threads; i++) {
+        if (g_zstd_cctx[i]) _ZSTD_freeCCtx(g_zstd_cctx[i]);
+        if (g_zstd_dctx[i]) _ZSTD_freeDCtx(g_zstd_dctx[i]);
+        g_zstd_cctx[i] = NULL;
+        g_zstd_dctx[i] = NULL;
+    }
+    if (g_libzstd) { dlclose(g_libzstd); g_libzstd = NULL; }
+}
+
+/* Leave incomplete frames in the socket so they cannot delay earlier replies.
+ * Only this worker reads the connection: once a complete WRITE is queued,
+ * consuming its header and payload cannot wait for the peer to send more. */
+static int peek_request_nb(int fd, struct nbd_req_hdr *h)
+{
+    ssize_t r;
+    do { r = recv(fd, h, sizeof(*h), MSG_PEEK | MSG_DONTWAIT); }
+    while (r < 0 && errno == EINTR);
     if (r == 0) return -1;                                   /* peer closed */
     if (r < 0)  return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
-    if ((size_t)r == sizeof(*h)) return 1;
-    return (recv_all(fd, (char *)h + r, sizeof(*h) - r) == 0) ? 1 : -1;
+    if ((size_t)r < sizeof(*h)) return 0;
+    uint32_t len = ntohl(h->len);
+    if (ntohs(h->type) == NBD_CMD_WRITE && len <= BATCH_SLOT) {
+        int queued;
+        int rc;
+        do { rc = ioctl(fd, FIONREAD, &queued); } while (rc < 0 && errno == EINTR);
+        if (rc < 0) return -1;
+        if ((size_t)queued < sizeof(*h) + len) return 0;
+    }
+    return 1;
 }
 
-/* Legacy per-request path: exact prior semantics, handles a single header that
+/* Per-request path: handles a single header that
  * was already read. Used for oversized requests, FLUSH/TRIM, and VRAM_BATCH=0.
  * Returns 0 to keep serving, -1 to drop the connection. */
 static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char *iobuf)
@@ -487,20 +1660,31 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char
             uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
             if (recv_all(fd, iobuf, chunk) != 0) return -1;
             if (!error) {
-                CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + voff, iobuf, chunk, stream);
-                if (r != CUDA_SUCCESS) {
-                    fprintf(stderr, "[nbd-vram] HtoD failed: %s\n", cuda_err(r));
-                    error = EIO;
+                if (packed_store_enabled()) {
+                    uint32_t e = comp_write(voff, iobuf, chunk, stream);
+                    if (e) error = e;
+                } else {
+                    CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + voff, iobuf, chunk, stream);
+                    /* The next recv overwrites this pinned buffer. Finish DMA
+                     * before reusing it, and keep large requests in small bursts. */
+                    CUresult sync_r = _cuStreamSynchronize(stream);
+                    if (r != CUDA_SUCCESS || sync_r != CUDA_SUCCESS) {
+                        if (r == CUDA_SUCCESS) r = sync_r;
+                        fprintf(stderr, "[nbd-vram] HtoD failed: %s\n", cuda_err(r));
+                        error = EIO;
+                    }
                 }
                 voff += chunk;
             }
             remaining -= chunk;
         }
-        if (!error) _cuStreamSynchronize(stream);
     } else if (cmd == NBD_CMD_FLUSH) {
-        _cuStreamSynchronize(stream);
+        if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) error = EIO;
+    } else if (cmd == NBD_CMD_TRIM && packed_store_enabled()) {
+        if (oob(offset, length)) error = EINVAL;
+        else error = comp_trim(offset, length, stream);
     }
-    /* TRIM: just ack success, VRAM doesn't need trimming */
+    /* Direct-mapped TRIM: ack success, VRAM doesn't need trimming. */
 
     struct nbd_resp_hdr resp;
     resp.magic  = htonl(NBD_RESPONSE_MAGIC);
@@ -508,19 +1692,24 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char
     resp.handle = handle;
     if (send_all(fd, &resp, sizeof(resp)) != 0) return -1;
     if (error == EIO) return -1;   /* real copy failure: hard-reset the connection */
-    if (error)        return 0;    /* bad request (EINVAL): reported, keep serving */
+    if (error)        return 0;    /* EINVAL / ENOSPC: reported, keep serving */
 
     if (cmd == NBD_CMD_READ) {
         uint32_t remaining = length;
         uint64_t voff      = offset;
         while (remaining > 0) {
             uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
-            CUresult r = _cuMemcpyDtoHAsync(iobuf, g_vram_ptr + voff, chunk, stream);
-            if (r != CUDA_SUCCESS) {
-                fprintf(stderr, "[nbd-vram] DtoH failed: %s\n", cuda_err(r));
-                return -1;
+            if (packed_store_enabled()) {
+                uint32_t e = comp_read(voff, iobuf, chunk, stream);
+                if (e) return -1;
+            } else {
+                CUresult r = _cuMemcpyDtoHAsync(iobuf, g_vram_ptr + voff, chunk, stream);
+                if (r != CUDA_SUCCESS) {
+                    fprintf(stderr, "[nbd-vram] DtoH failed: %s\n", cuda_err(r));
+                    return -1;
+                }
+                if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) return -1;
             }
-            _cuStreamSynchronize(stream);
             if (send_all(fd, iobuf, chunk) != 0) return -1;
             remaining -= chunk;
             voff      += chunk;
@@ -559,27 +1748,88 @@ static int batch_admit(int fd, const struct nbd_req_hdr *h, struct bop *op, char
     return 1;
 }
 
-/* Issue every batched copy on the stream, then a SINGLE synchronize for the whole
- * batch, then reply to each op. Stream FIFO order preserves intra-batch RAW/WAR.
+/* Group whole, aligned requests of one direction into at most COMP_BATCH pages.
+ * Repeated stripes (including overlapping pages) end the group, so earlier
+ * writes publish before later reads/writes are prepared. Partial requests use
+ * the read-modify-write path between groups. Staging and metadata stay bounded
+ * independently of VRAM_BATCH_DEPTH and the number of connections. */
+static void flush_packed_ops(struct bop *ops, int n, CUstream stream)
+{
+    for (int first = 0; first < n; ) {
+        struct bop *op = &ops[first];
+        if (op->error) { first++; continue; }
+        if (!t_cstage) { op->error = EIO; first++; continue; }
+        if (op->offset % COMP_PAGE || op->len % COMP_PAGE) {
+            op->error = op->cmd == NBD_CMD_WRITE
+                ? comp_write(op->offset, op->slot, op->len, stream)
+                : comp_read(op->offset, op->slot, op->len, stream);
+            first++;
+            continue;
+        }
+
+        uint8_t stripes[(NPLOCK + 7) / 8] = {0};
+        int end = first, pages = 0;
+        while (end < n) {
+            struct bop *next = &ops[end];
+            int count = (int)(next->len / COMP_PAGE);
+            if (next->error || next->cmd != op->cmd || next->offset % COMP_PAGE ||
+                next->len % COMP_PAGE || pages + count > COMP_BATCH) break;
+            uint64_t pg = next->offset / COMP_PAGE;
+            int conflict = 0;
+            for (int j = 0; j < count; j++)
+                if (bm_test(stripes, (unsigned)((pg + j) % NPLOCK))) conflict = 1;
+            if (conflict) break;
+            for (int j = 0; j < count; j++) bm_set(stripes, (unsigned)((pg + j) % NPLOCK));
+            pages += count;
+            end++;
+        }
+
+        struct cpend writes[COMP_BATCH];
+        struct rpend reads[COMP_BATCH];
+        int slot = 0;
+        for (int i = first; i < end; i++) {
+            for (uint32_t off = 0; off < ops[i].len; off += COMP_PAGE, slot++) {
+                uint64_t pg = (ops[i].offset + off) / COMP_PAGE;
+                if (op->cmd == NBD_CMD_WRITE)
+                    prepare_plain(pg, ops[i].slot + off, slot, &writes[slot]);
+                else
+                    reads[slot] = (struct rpend){ .pg = pg, .dst = ops[i].slot + off,
+                                                  .slot = (uint8_t)slot };
+            }
+        }
+        uint32_t error = op->cmd == NBD_CMD_WRITE
+            ? write_pending(writes, pages, stream) : rpend_commit(reads, pages, stream);
+        for (int i = first; i < end; i++) ops[i].error = error;
+        first = end;
+    }
+}
+
+/* Direct copies share one synchronize; packed requests use bounded page groups.
+ * All successful writes are published before their replies are sent.
  * NBD matches replies by handle, so a per-op error never strands the others: a bad
  * request (EINVAL) is reported and we keep serving; a real copy failure (EIO) is
  * reported too, then the connection is dropped after every reply is sent. */
 static int flush_batch(int fd, struct bop *ops, int n, CUstream stream)
 {
     int hard_err = 0;   /* an EIO occurred: reset the connection once all replies are out */
-    for (int i = 0; i < n; i++) {
-        if (ops[i].error) continue;
-        CUdeviceptr d = g_vram_ptr + ops[i].offset;
-        CUresult r = (ops[i].cmd == NBD_CMD_READ)
-            ? _cuMemcpyDtoHAsync(ops[i].slot, d, ops[i].len, stream)
-            : _cuMemcpyHtoDAsync(d, ops[i].slot, ops[i].len, stream);
-        if (r != CUDA_SUCCESS) {
-            fprintf(stderr, "[nbd-vram] batch copy failed: %s\n", cuda_err(r));
-            ops[i].error = EIO;
-            hard_err = 1;
+    if (packed_store_enabled()) {
+        flush_packed_ops(ops, n, stream);
+    } else {
+        for (int i = 0; i < n; i++) {
+            if (ops[i].error) continue;
+            CUdeviceptr d = g_vram_ptr + ops[i].offset;
+            CUresult r = (ops[i].cmd == NBD_CMD_READ)
+                ? _cuMemcpyDtoHAsync(ops[i].slot, d, ops[i].len, stream)
+                : _cuMemcpyHtoDAsync(d, ops[i].slot, ops[i].len, stream);
+            if (r != CUDA_SUCCESS) {
+                fprintf(stderr, "[nbd-vram] batch copy failed: %s\n", cuda_err(r));
+                ops[i].error = EIO;
+            }
+        }
+        if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) {
+            for (int i = 0; i < n; i++) if (!ops[i].error) ops[i].error = EIO;
         }
     }
-    _cuStreamSynchronize(stream);   /* one sync amortised across the whole batch */
 
     if (g_batch_debug) {            /* opt-in: measure real-world batch depth */
         __sync_fetch_and_add(&g_flush_count, 1);
@@ -589,6 +1839,7 @@ static int flush_batch(int fd, struct bop *ops, int n, CUstream stream)
     }
 
     for (int i = 0; i < n; i++) {
+        if (ops[i].error == EIO) hard_err = 1;
         struct nbd_resp_hdr resp;
         resp.magic  = htonl(NBD_RESPONSE_MAGIC);
         resp.error  = htonl(ops[i].error);
@@ -603,7 +1854,7 @@ static int flush_batch(int fd, struct bop *ops, int n, CUstream stream)
 
 static int handle_client(int fd, CUstream stream, char *batchbuf, char *iobuf)
 {
-    if (nbd_handshake(fd, g_vram_size) != 0) {
+    if (nbd_handshake(fd, g_export_size, packed_store_enabled()) != 0) {
         fprintf(stderr, "[nbd-vram] handshake failed\n");
         return -1;
     }
@@ -622,7 +1873,7 @@ static int handle_client(int fd, CUstream stream, char *batchbuf, char *iobuf)
         }
         if (ntohs(h.type) == NBD_CMD_DISC) break;
 
-        if (!g_batch_enabled) {
+        if (!g_batch_enabled || !batchbuf) {
             if (handle_one(fd, &h, stream, iobuf) != 0) return -1;
             continue;
         }
@@ -634,31 +1885,26 @@ static int handle_client(int fd, CUstream stream, char *batchbuf, char *iobuf)
             continue;
         }
 
-        /* Drain whatever else is already queued, without blocking. Idle clients
-         * yield a batch of 1 (= legacy behaviour); a busy client supplies depth.
-         * The adaptivity is free: we never wait to assemble a batch. */
+        /* Only collect complete frames already queued. A byte cap bounds GPU
+         * work even when depth is raised; direction changes end the batch so
+         * reads get replies before any later writes are submitted. */
         int n = 1;
+        size_t bytes = ops[0].len;
         struct nbd_req_hdr extra;
-        int trailer = 0;   /* 0 none, 1 non-batchable header in `extra`, 2 DISC */
-        while (n < depth) {
-            int g = recv_hdr_nb(fd, &extra);
-            if (g < 0) return -1;
-            if (g == 0) break;                /* nothing more queued right now */
-            if (ntohl(extra.magic) != NBD_REQUEST_MAGIC) {
-                fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(extra.magic));
-                return -1;
-            }
-            if (ntohs(extra.type) == NBD_CMD_DISC) { trailer = 2; break; }
-            int a = batch_admit(fd, &extra, &ops[n], batchbuf + (size_t)n * BATCH_SLOT);
-            if (a < 0) return -1;
-            if (a == 0) { trailer = 1; break; }   /* flush, then handle it per-op */
+        while (n < depth && bytes < BATCH_BYTES_MAX) {
+            int g = peek_request_nb(fd, &extra);
+            if (g <= 0) break;  /* reply to earlier work before EOF/error too */
+            uint32_t len = ntohl(extra.len);
+            if (ntohl(extra.magic) != NBD_REQUEST_MAGIC ||
+                ntohs(extra.type) != ops[0].cmd || !len || len > BATCH_SLOT ||
+                len > BATCH_BYTES_MAX - bytes) break;
+            if (recv_all(fd, &extra, sizeof(extra)) != 0) return -1;
+            if (batch_admit(fd, &extra, &ops[n], batchbuf + bytes) != 1) return -1;
+            bytes += len;
             n++;
         }
 
         if (flush_batch(fd, ops, n, stream) != 0) return -1;
-
-        if (trailer == 1) { if (handle_one(fd, &extra, stream, iobuf) != 0) return -1; }
-        else if (trailer == 2) break;
     }
     return 0;
 }
@@ -680,11 +1926,24 @@ static void *thread_worker(void *arg)
     _cuCtxSetCurrent(g_cu_ctx);
     _cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
     /* Pinned host memory: eliminates CUDA driver staging copy for each DMA.
-     * iobuf serves the per-op (oversized/FLUSH) path; batchbuf holds one slot
-     * per in-flight batched request. Both pinned, allocated once per worker. */
+     * iobuf serves the per-op path; batchbuf packs variable-length requests
+     * within the byte cap. Both pinned, allocated once per worker. */
     _cuMemAllocHost(&iobuf, IO_BUF_SIZE);
     if (g_batch_enabled)
-        _cuMemAllocHost(&batchbuf, (size_t)g_batch_depth * BATCH_SLOT);
+        _cuMemAllocHost(&batchbuf, BATCH_BYTES_MAX);
+    t_cstage = NULL;
+    t_cstage_cuda = 0;
+    t_zstd_cctx = g_zstd_cctx[idx];
+    t_zstd_dctx = g_zstd_dctx[idx];
+    if (packed_store_enabled()) {
+        if (_cuMemAllocHost((void **)&t_cstage, compression_stage_size()) == CUDA_SUCCESS) {
+            t_cstage_cuda = 1;
+        } else {
+            t_cstage = calloc(1, compression_stage_size());
+            if (!t_cstage)
+                fprintf(stderr, "[nbd-vram] compress staging alloc failed\n");
+        }
+    }
 
     while (g_running) {
         /* Draining (SIGTERM arrived with a client attached): take no new
@@ -719,6 +1978,11 @@ static void *thread_worker(void *arg)
         printf("[nbd-vram] client disconnected\n");
     }
 
+    if (t_cstage) {
+        if (t_cstage_cuda) _cuMemFreeHost(t_cstage);
+        else               free(t_cstage);
+        t_cstage = NULL;
+    }
     if (batchbuf) _cuMemFreeHost(batchbuf);
     if (iobuf)    _cuMemFreeHost(iobuf);
     _cuStreamDestroy(stream);
@@ -733,6 +1997,29 @@ int main(void)
 {
     CUdevice  cu_dev;
     int       ret    = 1;
+    /* Startup/tuning diagnostics must reach the journal while we are running. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    const char *sched = getenv("VRAM_CUDA_SCHED");
+    unsigned int cuda_sched = CU_CTX_SCHED_BLOCKING_SYNC;
+    if (sched && strcmp(sched, "auto") == 0) cuda_sched = CU_CTX_SCHED_AUTO;
+    else if (sched && strcmp(sched, "blocking") != 0) {
+        fprintf(stderr, "[nbd-vram] invalid VRAM_CUDA_SCHED='%s' (expected blocking or auto)\n", sched);
+        return 1;
+    }
+
+    const char *cenv = getenv("VRAM_COMPRESS");
+    if (parse_compression(cenv, &g_compress, &g_compress_level) != 0) {
+        fprintf(stderr, "[nbd-vram] invalid VRAM_COMPRESS='%s' (expected off, lz4, zstd, or zstd:LEVEL with LEVEL 1..22)\n", cenv);
+        return 1;
+    }
+
+    const char *denv = getenv("VRAM_DEDUP");
+    if (denv && strcmp(denv, "0") != 0 && strcmp(denv, "1") != 0) {
+        fprintf(stderr, "[nbd-vram] invalid VRAM_DEDUP='%s' (expected 0 or 1)\n", denv);
+        return 1;
+    }
+    g_dedup = denv && strcmp(denv, "1") == 0;
 
     /* Socket path is fixed in production; VRAM_SOCK_PATH overrides it for
      * non-root testing. Resolved early so every cleanup path sees it. */
@@ -777,10 +2064,36 @@ int main(void)
     }
 
     if (_cuDeviceGet(&cu_dev, 0) != CUDA_SUCCESS) goto out;
-    if (_cuCtxCreate(&g_cu_ctx, CU_CTX_SCHED_AUTO, cu_dev) != CUDA_SUCCESS) goto out;
+    if (_cuCtxCreate(&g_cu_ctx, cuda_sched, cu_dev) != CUDA_SUCCESS) goto out;
+    printf("[nbd-vram] CUDA waits: %s\n",
+           cuda_sched == CU_CTX_SCHED_BLOCKING_SYNC ? "blocking" : "auto");
 
     const char *env = getenv("VRAM_SETUP_SIZE_MB");
     size_t mb = env ? (size_t)atol(env) : DEFAULT_SIZE_MB;
+
+    {
+        const char *tenv = getenv("VRAM_NBD_THREADS");
+        if (tenv) {
+            g_nbd_threads = atoi(tenv);
+            if (g_nbd_threads < 1) g_nbd_threads = 1;
+            if (g_nbd_threads > NBD_THREADS_MAX) g_nbd_threads = NBD_THREADS_MAX;
+        }
+        const char *benv = getenv("VRAM_BATCH");
+        if (benv) g_batch_enabled = atoi(benv) != 0;
+        const char *bdenv = getenv("VRAM_BATCH_DEPTH");
+        if (bdenv) {
+            g_batch_depth = atoi(bdenv);
+            if (g_batch_depth < 1) g_batch_depth = 1;
+            if (g_batch_depth > BATCH_DEPTH_MAX) g_batch_depth = BATCH_DEPTH_MAX;
+        }
+        const char *bgenv = getenv("VRAM_BATCH_DEBUG");
+        if (bgenv) g_batch_debug = atoi(bgenv) != 0;
+        const char *renv = getenv("VRAM_COMPRESS_RATIO");
+        if (renv && parse_ratio_tenths(renv, &g_compress_ratio_tenths) != 0) {
+            fprintf(stderr, "[nbd-vram] invalid VRAM_COMPRESS_RATIO='%s' (expected 1.0..8.0, one decimal)\n", renv);
+            goto out_cuda;
+        }
+    }
 
     /* Back off 512 MiB at a time if the GPU is short on memory (e.g. display compositor loaded) */
     g_vram_ptr = 0;
@@ -801,6 +2114,20 @@ int main(void)
     }
     printf("[nbd-vram] VRAM at CUDA VA 0x%llx\n", (unsigned long long)g_vram_ptr);
 
+    g_export_size = g_vram_size;
+    if (packed_store_enabled()) {
+        g_export_size = (g_vram_size * (uint64_t)g_compress_ratio_tenths) / 10ULL;
+        if (compress_init() != 0) goto out_cuda;
+        printf("[nbd-vram] compression: %s, dedup: %s (ratio %.1fx, %llu MiB VRAM advertised as %llu MiB swap, %llu pages)\n",
+               compression_name(), g_dedup ? "on" : "off", (double)g_compress_ratio_tenths / 10.0,
+               (unsigned long long)(g_vram_size >> 20),
+               (unsigned long long)(g_export_size >> 20),
+               (unsigned long long)g_npages);
+    } else {
+        printf("[nbd-vram] compression: off (1:1 VRAM mapping, %llu MiB)\n",
+               (unsigned long long)(g_vram_size >> 20));
+    }
+
     /* Create Unix socket (path resolved at top of main; VRAM_SOCK_PATH may
      * override it for non-root testing). */
     unlink(sock_path);
@@ -820,6 +2147,9 @@ int main(void)
     fcntl(g_listen_fd, F_SETFL, fcntl(g_listen_fd, F_GETFL, 0) | O_NONBLOCK);
 
     printf("[nbd-vram] listening on %s (%d threads)\n", sock_path, g_nbd_threads);
+    printf("[nbd-vram] request batching %s (depth %d, max %d KiB total); I/O chunks %d KiB\n",
+           g_batch_enabled ? "on" : "off", g_batch_depth, BATCH_BYTES_MAX / 1024,
+           IO_BUF_SIZE / 1024);
 
     /* sd_notify READY=1 */
     {
@@ -838,32 +2168,20 @@ int main(void)
     }
 
     {
-        const char *tenv = getenv("VRAM_NBD_THREADS");
-        if (tenv) {
-            g_nbd_threads = atoi(tenv);
-            if (g_nbd_threads < 1) g_nbd_threads = 1;
-            if (g_nbd_threads > NBD_THREADS_MAX) g_nbd_threads = NBD_THREADS_MAX;
-        }
-
-        const char *benv = getenv("VRAM_BATCH");
-        if (benv) g_batch_enabled = atoi(benv) != 0;
-        const char *bdenv = getenv("VRAM_BATCH_DEPTH");
-        if (bdenv) {
-            g_batch_depth = atoi(bdenv);
-            if (g_batch_depth < 1) g_batch_depth = 1;
-            if (g_batch_depth > BATCH_DEPTH_MAX) g_batch_depth = BATCH_DEPTH_MAX;
-        }
-        const char *bgenv = getenv("VRAM_BATCH_DEBUG");
-        if (bgenv) g_batch_debug = atoi(bgenv) != 0;
-        printf("[nbd-vram] request batching %s (depth %d, slot %d KiB)\n",
-               g_batch_enabled ? "on" : "off", g_batch_depth, BATCH_SLOT / 1024);
-
         pthread_t threads[NBD_THREADS_MAX];
+        pthread_t st;
+        int have_st = 0;
         for (int i = 0; i < g_nbd_threads; i++) g_client_fds[i] = -1;
+        if (packed_store_enabled()) {
+            pthread_create(&st, NULL, status_worker, NULL);
+            have_st = 1;
+        }
         for (int i = 0; i < g_nbd_threads; i++)
             pthread_create(&threads[i], NULL, thread_worker, (void *)(intptr_t)i);
         for (int i = 0; i < g_nbd_threads; i++)
             pthread_join(threads[i], NULL);
+        g_running = 0;
+        if (have_st) pthread_join(st, NULL);
     }
     ret = 0;
 
@@ -873,6 +2191,7 @@ out_cuda:
         g_listen_fd = -1;
     }
     unlink(sock_path);
+    if (packed_store_enabled()) compress_shutdown();
     if (g_vram_ptr) _cuMemFree(g_vram_ptr);
     if (g_cu_ctx)   _cuCtxDestroy(g_cu_ctx);
     if (g_libcuda)  dlclose(g_libcuda);
